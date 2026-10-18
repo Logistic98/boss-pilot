@@ -1,0 +1,7 @@
+.codex/ export-ignore
+.codegraph/ export-ignore
+.build/ export-ignore
+dist/ export-ignore
+.DS_Store export-ignore
+*.log export-ignore
+*.har export-ignore
