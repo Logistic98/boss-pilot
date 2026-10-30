@@ -5577,6 +5577,8 @@ struct SelfCheck {
             "空闲自动化 Controller 退出时未完成优雅收敛或未 flush 最新 AppStore"
         )
         passed.append("idle automation termination flush")
+        try verifyBoundedTermination()
+        passed.append("bounded active termination preserves unknown writes and latest state")
 
         let legacyBackupURL = stateURL.deletingLastPathComponent().appendingPathComponent("state.backup.json")
         try Data("legacy-sensitive-state".utf8).write(to: legacyBackupURL)
@@ -5791,6 +5793,78 @@ struct SelfCheck {
         }
         guard let completion else { task.cancel(); throw SelfCheckError.failed("后台响应测试超时") }
         try completion.get()
+    }
+
+    private static func verifyBoundedTermination() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("BossPilot-ActiveTermination-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let persistence = JSONStatePersistence(fileURL: root.appendingPathComponent("state.json"))
+        var state = AppSnapshot()
+        var account = BossAccount(displayName: "退出测试")
+        var profile = BossAccountProfile()
+        profile.remoteID = "exit-identity"
+        account.remoteProfile = profile
+        state.accounts = [account]
+        let now = Date()
+        state.resumeDeliveryRecords = [ResumeDeliveryState.preparingAttachment, .dispatching].enumerated().map { index, stage in
+            let evidence = ResumeConsentEvidence(
+                accountID: account.id, remoteIdentityID: profile.remoteID,
+                conversationID: "exit-conversation-\(index)", triggerRemoteMID: String(1001 + index),
+                triggerTextDigest: String(repeating: "1", count: 64), receivedAt: now,
+                exchangeKind: .requestRecruiterConfirmation, nativeActionAID: nil, nativeScene: nil
+            )
+            var record = ResumeDeliveryRecord(evidence: evidence, attachmentSHA256: String(repeating: "2", count: 64), now: now)
+            record.state = stage
+            if stage == .dispatching { record.writeStartedAt = now }
+            return record
+        }
+        var greeting = AutomaticGreetingAttempt(accountID: account.id, remoteIdentityID: profile.remoteID,
+                                               remoteJobID: "exit-greeting", attemptedAt: now)
+        greeting.deliveryWriteStartedAt = now
+        state.automaticGreetingAttempts = [greeting]
+        try persistence.save(state)
+        let store = AppStore(persistence: persistence)
+        store.load()
+        try verify(store.snapshot.resumeDeliveryRecords.contains { $0.state == .dispatching },
+                   "退出测试未保留在途写入")
+        let api = BossAPIService(allowsWebFallback: false)
+        let controller = BossAutomationController(api: api)
+        let token = api.requestToken(accountID: account.id)
+        let generation = try required(controller.beginOperation(accountID: account.id, profileID: UUID()),
+                                      "无法准备退出中的未完成读取")
+        var completed = false
+        var heartbeatTicks = 0
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                heartbeatTicks += 1
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+        let start = Date()
+        let task = Task { @MainActor in
+            await controller.prepareForTermination(using: store)
+            completed = true
+        }
+        let deadline = start.addingTimeInterval(1.5)
+        while !completed, Date() < deadline {
+            _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+        heartbeat.cancel()
+        guard completed else { task.cancel(); throw SelfCheckError.failed("退出仍在等待网络任务自然结束") }
+        let elapsed = Date().timeIntervalSince(start)
+        let saved = try persistence.load()
+        try verify(elapsed < 1.5 && heartbeatTicks > 5 &&
+                   api.requestToken(accountID: account.id) != token &&
+                   controller.beginOperation(accountID: account.id, profileID: UUID()) == nil,
+                   "退出取消无界、阻塞主线程或仍允许新任务启动")
+        try verify(saved.resumeDeliveryRecords.contains { $0.state == .queued } &&
+                   saved.resumeDeliveryRecords.contains { $0.state == .failed && $0.failureCode == .requestOutcomeUnknown } &&
+                   saved.automaticGreetingAttempts.first?.deliveryWriteStartedAt != nil &&
+                   saved.automaticGreetingAttempts.first?.succeededAt == nil &&
+                   !saved.resumeConsentSafetyRecords.isEmpty,
+                   "快速退出丢失了未知外发状态或消耗了可重试的附件准备")
+        controller.finishOperation(accountID: account.id, generation: generation)
+        print(String(format: "EXIT active cancellation and durable save: %.0f ms; main actor heartbeat %d", elapsed * 1000, heartbeatTicks))
     }
 
     private static func verifyCandidateSupply() throws {

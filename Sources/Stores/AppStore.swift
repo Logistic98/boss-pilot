@@ -3179,6 +3179,20 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// 排在已有保存之后写入最新快照，退出等待磁盘时保持主线程响应。
+    func flushForTermination() async {
+        guard !persistenceBlocked else { return }
+        saveTask?.cancel()
+        saveTask = nil
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                persistence.saveInBackground(snapshot) { continuation.resume(with: $0) }
+            }
+        } catch {
+            lastError = "保存本地数据失败：\(error.localizedDescription)"
+        }
+    }
+
     /// 简历写入同步持久化；失败时恢复完整内存快照，禁止以未落盘许可继续外发。
     private func persistResumeDeliveryMutation<Result>(
         _ mutation: () throws -> Result

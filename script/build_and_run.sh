@@ -11,6 +11,7 @@ trap '[[ -z "$TEMP_ROOT" ]] || rm -rf "$TEMP_ROOT"' EXIT
 usage() {
   echo "usage: $0 [run|--debug-run|--debug|--logs|--telemetry|--ui-preview]"
   echo "       $0 --verify [APP_OR_ZIP]"
+  echo "       $0 --package"
   echo "       $0 --release vMAJOR.MINOR.PATCH [--publish] [--repo OWNER/REPO]"
   echo "       $0 [--greeting-delivery|--greeting-confirmation|--greeting-reset-confirmed-absent]"
 }
@@ -264,7 +265,7 @@ wait_for_expected_process() {
 MODE="${1:-run}"
 [[ $# -eq 0 ]] || shift
 case "$MODE" in
-  debug-run|debug|logs|telemetry|verify|ui-preview) MODE="--$MODE" ;;
+  debug-run|debug|logs|telemetry|verify|ui-preview|package) MODE="--$MODE" ;;
 esac
 case "$MODE" in
   --help|-h) usage; exit 0 ;;
@@ -280,7 +281,7 @@ case "$MODE" in
     release_app "$@"
     exit 0
     ;;
-  run|--debug-run|--debug|--logs|--telemetry|--ui-preview|--greeting-delivery|--greeting-confirmation|--greeting-reset-confirmed-absent)
+  run|--package|--debug-run|--debug|--logs|--telemetry|--ui-preview|--greeting-delivery|--greeting-confirmation|--greeting-reset-confirmed-absent)
     [[ $# -eq 0 ]] || { usage >&2; exit 2; }
     ;;
   *) usage >&2; exit 2 ;;
@@ -315,6 +316,9 @@ open_app() {
 }
 
 case "$MODE" in
+  --package)
+    echo "packaged app: $APP_BUNDLE (source sha256 $BUILD_FINGERPRINT)"
+    ;;
   run|--debug-run)
     open_app
     ;;

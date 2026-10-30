@@ -254,66 +254,41 @@ final class BossAutomationController: ObservableObject {
         }
     }
 
-    /// 停止接收新任务，等待在途操作完成；宽限期结束后才释放网络客户端，避免丢失写入结果。
+    /// 先封存未知写入并取消任务，仅短暂等待取消回调，不等待平台响应。
     func prepareForTermination(
         using store: AppStore,
-        gracefulTimeoutNanoseconds: UInt64 = 12_000_000_000
+        gracefulTimeoutNanoseconds: UInt64 = 500_000_000
     ) async {
         if terminationRequested {
-            store.flush()
+            await store.flushForTermination()
             return
         }
         terminationRequested = true
         automaticResumeWritePermitAccountIDs.removeAll()
 
-        // 代际检查阻止下一轮任务，在途交换及回读不随 worker 一起取消。
         workerGeneration &+= 1
+        // 写入边界已有持久化账本；退出不依赖远端回执，未知结果继续禁止重发。
+        conservativelyFinalizeInterruptedResumeDeliveries(using: store)
+        workerTask?.cancel()
+        cancelAllOperations()
+        for account in store.snapshot.accounts {
+            codexController?.cancelOperations(accountID: account.id)
+        }
         let pollNanoseconds: UInt64 = 50_000_000
-        var waitedNanoseconds: UInt64 = 0
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .nanoseconds(Int64(clamping: gracefulTimeoutNanoseconds)))
         while (!runningAccountIDs.isEmpty || isCycleRunning),
-              waitedNanoseconds < gracefulTimeoutNanoseconds {
+              clock.now < deadline {
             do {
                 try await Task.sleep(nanoseconds: pollNanoseconds)
             } catch {
                 break
             }
-            waitedNanoseconds = min(
-                gracefulTimeoutNanoseconds,
-                waitedNanoseconds &+ pollNanoseconds
-            )
         }
-
-        let drainedNaturally = runningAccountIDs.isEmpty && !isCycleRunning
-        if drainedNaturally {
-            let finishingWorker = workerTask
-            finishingWorker?.cancel()
-            _ = await finishingWorker?.value
-        } else {
-            // 已提交的交换保留为结果未知；尚未提交的附件准备仍可重试。
-            conservativelyFinalizeInterruptedResumeDeliveries(using: store)
-            workerTask?.cancel()
-            let activeAccountIDs = Array(runningAccountIDs)
-            cancelAllOperations()
-            for accountID in activeAccountIDs {
-                await api.cancelActiveRequests(accountID: accountID)
-                codexController?.cancelOperations(accountID: accountID)
-            }
-
-            var cancellationWait: UInt64 = 0
-            while !runningAccountIDs.isEmpty, cancellationWait < 2_000_000_000 {
-                do {
-                    try await Task.sleep(nanoseconds: pollNanoseconds)
-                } catch {
-                    break
-                }
-                cancellationWait &+= pollNanoseconds
-            }
-            conservativelyFinalizeInterruptedResumeDeliveries(using: store)
-        }
-
+        conservativelyFinalizeInterruptedResumeDeliveries(using: store)
         workerTask = nil
         isWorkerRunning = false
-        store.flush()
+        await store.flushForTermination()
     }
 
     func runCycle(using store: AppStore, sessions: BossSessionCoordinator, codex: CodexController) async {
