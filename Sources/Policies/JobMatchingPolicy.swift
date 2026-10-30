@@ -159,6 +159,27 @@ struct JobMatchingPolicy {
         return failures
     }
 
+    /// 只使用列表中已有的明确证据；未知薪资、地点和缺失关键词仍需读取详情。
+    static func hasDefinitiveListMismatch(job: JobListing, preferences: JobPreferences) -> Bool {
+        if !matchingExclusions(in: job.evidenceText, preferences: preferences).isEmpty { return true }
+        if let desiredSalary = salaryRange(from: preferences.requirementText),
+           let candidateSalary = salaryRange(from: job.salary),
+           !salaryRangesOverlap(candidate: candidateSalary, desired: desiredSalary) {
+            return true
+        }
+        let allowedCities = JobSearchPlanningPolicy.cities(in: preferences.requirementText)
+        let allowedCodes = allowedCities.compactMap { BossCityResolver.code(for: $0) }
+        if hasStrictLocationConstraint(preferences.requirementText),
+           !allowedCodes.isEmpty, allowedCodes.count == allowedCities.count,
+           let candidateCode = BossCityResolver.code(for: job.displayLocation),
+           BossCityResolver.name(forCode: candidateCode) != nil,
+           candidateCode != BossCityResolver.code(for: "全国"),
+           !allowedCodes.contains(candidateCode) {
+            return true
+        }
+        return false
+    }
+
     static func matchingExclusions(in text: String, preferences: JobPreferences) -> [String] {
         let evidence = normalized(text)
         // 忽略“不是27校招岗”等明确否定校招的表述。

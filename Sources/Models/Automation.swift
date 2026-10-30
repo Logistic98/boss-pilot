@@ -323,14 +323,18 @@ struct AutomaticGreetingSafetyRecord: Identifiable, Codable, Hashable {
     var id: String
     var identityFingerprint: String
     var attemptedAt: Date
+    var recipientFingerprint: String? = nil
 
-    init(remoteIdentityID: String, remoteJobID: String, attemptedAt: Date) {
+    init(remoteIdentityID: String, remoteJobID: String, attemptedAt: Date, remoteRecipientID: String? = nil) {
         self.id = AutomaticGreetingAttempt.identifier(
             remoteIdentityID: remoteIdentityID,
             remoteJobID: remoteJobID
         )
         self.identityFingerprint = Self.identityFingerprint(remoteIdentityID: remoteIdentityID)
         self.attemptedAt = attemptedAt
+        self.recipientFingerprint = remoteRecipientID.map {
+            AutomaticGreetingAttempt.identifier(remoteIdentityID: remoteIdentityID, remoteJobID: "recipient:\($0)")
+        }
     }
 
     init(attempt: AutomaticGreetingAttempt) {
@@ -365,6 +369,11 @@ enum AutomaticGreetingPacingPolicy {
 enum JobDetailBatchPolicy {
     static let maximumDetailsPerPass = 4
     static let minimumPersistedBacklogShare = 1
+    static let candidateBufferSize = 8
+
+    static func needsCandidates(queuedCount: Int, usedDailyQuota: Int, dailyLimit: Int) -> Bool {
+        queuedCount < candidateBufferSize && usedDailyQuota < dailyLimit
+    }
 
     static func canReadDetail(lastFailureAt: Date?, now: Date = Date()) -> Bool {
         lastFailureAt.map { now.timeIntervalSince($0) >= 15 * 60 } ?? true
@@ -449,6 +458,7 @@ enum AutomationWorkerSchedulePolicy {
     static let retryFloorSeconds: TimeInterval = 10
     static let responsiveWakeFloorSeconds: TimeInterval = 0.25
     static let detailBacklogRetrySeconds: TimeInterval = 15 * 60
+    static let candidateReplenishmentIntervalSeconds: TimeInterval = 90
 
     static func secondsUntilDue(
         lastCompletedAt: Date?,
@@ -471,16 +481,22 @@ enum AutomationWorkerSchedulePolicy {
         return now.timeIntervalSince(lastCompletedAt) >= TimeInterval(max(1, intervalMinutes) * 60)
     }
 
-    static func detailBacklogIsDue(lastAttemptAt: Date?, now: Date) -> Bool {
+    static func detailBacklogIsDue(
+        lastAttemptAt: Date?, now: Date,
+        intervalSeconds: TimeInterval = detailBacklogRetrySeconds
+    ) -> Bool {
         guard let lastAttemptAt else { return true }
-        return now.timeIntervalSince(lastAttemptAt) >= detailBacklogRetrySeconds
+        return now.timeIntervalSince(lastAttemptAt) >= intervalSeconds
     }
 
-    static func secondsUntilDetailBacklogDue(lastAttemptAt: Date?, now: Date) -> TimeInterval {
+    static func secondsUntilDetailBacklogDue(
+        lastAttemptAt: Date?, now: Date,
+        intervalSeconds: TimeInterval = detailBacklogRetrySeconds
+    ) -> TimeInterval {
         guard let lastAttemptAt else { return retryFloorSeconds }
         return max(
             retryFloorSeconds,
-            detailBacklogRetrySeconds - now.timeIntervalSince(lastAttemptAt)
+            intervalSeconds - now.timeIntervalSince(lastAttemptAt)
         )
     }
 

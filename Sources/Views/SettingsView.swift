@@ -130,8 +130,10 @@ struct AutomationSettingsTab: View {
         AutomationCard(title: "岗位检索", systemImage: "magnifyingglass") {
             Label("自动检索已开启", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
-            Stepper("检索周期：每 \(store.snapshot.automation.searchIntervalMinutes) 分钟",
-                    value: intBinding(\.searchIntervalMinutes), in: AutomationSettings.searchIntervalMinutesRange, step: 5)
+            Text("待开聊不足 \(JobDetailBatchPolicy.candidateBufferSize) 个时按需补货，充足时暂停。")
+            Text("每批结束至少等待 \(Int(AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds)) 秒，消息处理与发送优先。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Toggle("同步后自动评估", isOn: boolBinding(\.automaticallyAssessJobs))
         }
     }

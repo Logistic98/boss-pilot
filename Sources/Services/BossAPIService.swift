@@ -121,6 +121,24 @@ enum BossServerFailurePolicy {
         manualVerificationCodes.contains(code)
     }
 
+    static func requiresSafetyCooldown(_ error: BossAPIError) -> Bool {
+        switch error {
+        case .httpStatus(429), .httpStatus(403), .manualVerificationRequired:
+            return true
+        case .upstream(_, let code, let message):
+            let riskMarkers = [
+                "频繁", "限流", "too many requests", "rate limit",
+                "账号已封禁", "账号被封禁", "账号已冻结", "账号被冻结",
+                "account suspended", "account banned"
+            ]
+            return code == 9 || riskMarkers.contains {
+                message.localizedCaseInsensitiveContains($0)
+            }
+        default:
+            return false
+        }
+    }
+
     static func error(
         operation: BossAPIOperation,
         code: Int,
@@ -487,6 +505,7 @@ actor BossAPIService {
                 payloads[request.operation] = result.object
             } catch let error as BossAPIError {
                 guard !request.isRequired else { throw error }
+                if BossServerFailurePolicy.requiresSafetyCooldown(error) { throw error }
                 switch error {
                 case .httpStatus, .upstream, .invalidPayload, .unsupported:
                     warnings.append(error.localizedDescription)
@@ -731,7 +750,8 @@ enum BossPayloadParser {
             }
             records.append(AutomaticGreetingSafetyRecord(
                 remoteIdentityID: remoteIdentityID, remoteJobID: jobID,
-                attemptedAt: Date(timeIntervalSince1970: time.doubleValue / 1000)
+                attemptedAt: Date(timeIntervalSince1970: time.doubleValue / 1000),
+                remoteRecipientID: (row["encryptBossId"] as? String)?.nilIfBlank
             ))
         }
         guard zip(records, records.dropFirst()).allSatisfy({ $0.attemptedAt >= $1.attemptedAt }) else {

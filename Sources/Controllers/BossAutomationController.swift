@@ -655,6 +655,14 @@ final class BossAutomationController: ObservableObject {
                store: store,
                forceInitialSearch: forceInitialSearch
            ) {
+            let detailBacklogOnly = usesCandidateSupply(store: store)
+                ? !forceInitialSearch && hasPersistedDetailBacklog(accountID: account.id, store: store)
+                : !AutomationWorkerSchedulePolicy.jobSearchIsDue(
+                    lastCompletedAt: effectiveLastSearchAt(accountID: account.id, store: store),
+                    intervalMinutes: effectiveSearchIntervalMinutes(accountID: account.id, store: store),
+                    forceInitialSearch: forceInitialSearch,
+                    now: Date()
+                )
             let searchOutcome = await searchJobs(
                 account: account,
                 session: session,
@@ -663,12 +671,8 @@ final class BossAutomationController: ObservableObject {
                 useCodex: true,
                 allowExternalActions: false,
                 startupQuickPass: forceInitialSearch,
-                detailBacklogOnly: !AutomationWorkerSchedulePolicy.jobSearchIsDue(
-                    lastCompletedAt: effectiveLastSearchAt(accountID: account.id, store: store),
-                    intervalMinutes: effectiveSearchIntervalMinutes(accountID: account.id, store: store),
-                    forceInitialSearch: forceInitialSearch,
-                    now: Date()
-                )
+                detailBacklogOnly: detailBacklogOnly,
+                prioritizeGreetings: true
             )
             if searchOutcome == .performed {
                 result.attemptedInitialSearch = forceInitialSearch
@@ -707,7 +711,8 @@ final class BossAutomationController: ObservableObject {
         useCodex: Bool = true,
         allowExternalActions: Bool = false,
         startupQuickPass: Bool = false,
-        detailBacklogOnly: Bool = false
+        detailBacklogOnly: Bool = false,
+        prioritizeGreetings: Bool = false
     ) async -> AccountOperationOutcome {
         codexController = codex
         guard store.snapshot.accounts.contains(where: { $0.id == account.id && $0.status == .active }) else { return .unavailable }
@@ -723,9 +728,10 @@ final class BossAutomationController: ObservableObject {
         guard await ensureProfileBinding(account: account, session: session, store: store) else { return .unavailable }
         guard let identityRevision = session.currentIdentityRevision(requiringProfileBinding: true) else { return .unavailable }
         guard let operationGeneration = beginOperation(accountID: account.id, profileID: account.webProfileID) else { return .busy }
-        defer { finishOperation(accountID: account.id, generation: operationGeneration) }
-        if hasPersistedDetailBacklog(accountID: account.id, store: store) {
+        defer {
+            // 从批次完成计时，避免慢请求结束后立即连续补货。
             detailBacklogAttemptAtByAccount[account.id] = Date()
+            finishOperation(accountID: account.id, generation: operationGeneration)
         }
         do {
             let requestToken = api.requestToken(accountID: account.id)
@@ -833,6 +839,7 @@ final class BossAutomationController: ObservableObject {
                     job.securityID?.nilIfBlank != nil &&
                     job.listID?.nilIfBlank != nil &&
                     !currentRemoteJobIDs.contains(job.remoteJobID ?? "") &&
+                    !JobMatchingPolicy.hasDefinitiveListMismatch(job: job, preferences: store.snapshot.preferences) &&
                     JobDetailBatchPolicy.canReadDetail(lastFailureAt: detailReadFailedAt[job.id])
             }
             let priorityJobs = remoteJobs.map { $0.listing(accountID: account.id, detailFetchedAt: nil) } + persistedDetailBacklog
@@ -857,7 +864,9 @@ final class BossAutomationController: ObservableObject {
                 return lhs.id < rhs.id
             }
             let currentDetailReadAllowed = remoteJobs.map {
-                JobDetailBatchPolicy.canReadDetail(lastFailureAt: detailReadFailedAt[$0.listing(accountID: account.id).id])
+                let listing = $0.listing(accountID: account.id)
+                return !JobMatchingPolicy.hasDefinitiveListMismatch(job: listing, preferences: store.snapshot.preferences) &&
+                    JobDetailBatchPolicy.canReadDetail(lastFailureAt: detailReadFailedAt[listing.id])
             }
             let currentPendingDetailCount = remoteJobs.indices.filter {
                 existingJobsByRemoteID[remoteJobs[$0].remoteJobID]?.hasCachedDetail != true &&
@@ -879,16 +888,20 @@ final class BossAutomationController: ObservableObject {
             let selectedPersistedBacklog = Array(persistedDetailBacklog.prefix(allocation[1]))
             let pendingDetailCount = currentPendingDetailCount + persistedDetailBacklog.count
             let detailLimit = detailIndices.count + selectedPersistedBacklog.count
-            let hasRemainingDetailBacklog = pendingDetailCount > detailLimit
+            var detailReadCount = 0
             var detailFetchedAtByRemoteKey: [String: Date] = [:]
             var hydratedPersistedListings: [JobListing] = []
             if detailLimit > 0 {
-                statusByAccount[account.id] = hasRemainingDetailBacklog
+                statusByAccount[account.id] = pendingDetailCount > detailLimit
                     ? "补齐缺失详情：本批 \(detailLimit) 个，待补齐 \(pendingDetailCount) 个"
                     : "正在读取 \(detailLimit) 个岗位详情"
             }
             for index in detailIndices {
+                if prioritizeGreetings,
+                   candidateSupplyIsFull(accountID: account.id, store: store) ||
+                    shouldYieldToGreeting(accountID: account.id, store: store) { break }
                 do {
+                    detailReadCount += 1
                     let detail = try await api.jobDetail(
                         accountID: account.id,
                         profileID: account.webProfileID,
@@ -917,6 +930,9 @@ final class BossAutomationController: ObservableObject {
                     let fetchedAt = Date()
                     detailFetchedAtByRemoteKey[remoteJobs[index].stableRemoteKey] = fetchedAt
                     store.upsertJobs([remoteJobs[index].listing(accountID: account.id, detailFetchedAt: fetchedAt)])
+                    if store.snapshot.automation.automaticallyAssessJobs {
+                        _ = await store.assessPendingJobsLocally(accountID: account.id)
+                    }
                     store.flush()
                     if remoteJobs[index].description.nilIfBlank != nil {
                         detailReadFailedAt[remoteJobs[index].listing(accountID: account.id).id] = nil
@@ -961,9 +977,13 @@ final class BossAutomationController: ObservableObject {
                 }
             }
             for persistedJob in selectedPersistedBacklog {
+                if prioritizeGreetings,
+                   candidateSupplyIsFull(accountID: account.id, store: store) ||
+                    shouldYieldToGreeting(accountID: account.id, store: store) { break }
                 guard let securityID = persistedJob.securityID?.nilIfBlank,
                       let listID = persistedJob.listID?.nilIfBlank else { continue }
                 do {
+                    detailReadCount += 1
                     let detail = try await api.jobDetail(
                         accountID: account.id,
                         profileID: account.webProfileID,
@@ -992,6 +1012,9 @@ final class BossAutomationController: ObservableObject {
                     let listing = hydrated.listing(accountID: account.id, detailFetchedAt: Date())
                     hydratedPersistedListings.append(listing)
                     store.upsertJobs([listing])
+                    if store.snapshot.automation.automaticallyAssessJobs {
+                        _ = await store.assessPendingJobsLocally(accountID: account.id)
+                    }
                     store.flush()
                     detailReadFailedAt[persistedJob.id] = nil
                     if !listing.hasAuthoritativeDescription {
@@ -1118,6 +1141,7 @@ final class BossAutomationController: ObservableObject {
                 lastSearchAtByAccount[account.id] = Date()
             }
             let queuedCount = store.queuedAutomaticGreetingCandidateCount(accountID: account.id)
+            let hasRemainingDetailBacklog = pendingDetailCount > detailReadCount
             let dailyLimitReached = store.automaticGreetingCountToday(accountID: account.id) >=
                 store.snapshot.automation.dailyGreetingLimit
             statusByAccount[account.id] = dailyLimitReached && queuedCount > 0
@@ -1130,9 +1154,9 @@ final class BossAutomationController: ObservableObject {
                     ? "启动首批岗位处理完成"
                     : hasRemainingDetailBacklog ? "BOSS 岗位详情分批完成" : "BOSS 岗位检索完成",
                 detail: startupQuickPass
-                    ? "首批岗位已经显示；本轮最多补齐 4 个详情；Codex 在后台细评，后续继续补充候选。"
+                    ? "首批岗位已经显示；本轮读取 \(detailReadCount) 个详情；合格候选优先开聊，Codex 在后台细评。"
                     : hasRemainingDetailBacklog
-                    ? "本批已补齐 \(detailLimit) 个岗位详情，同页剩余 \(pendingDetailCount - detailLimit) 个将在下一轮继续；新候选可立即进入开聊。"
+                    ? "本批读取 \(detailReadCount) 个岗位详情，剩余 \(pendingDetailCount - detailReadCount) 个按需继续；待开聊 \(queuedCount) 个。"
                     : "按 \(activeSearchTargets.map { "\($0.query)·\($0.city)" }.joined(separator: "、")) 检索第 \(searchPage) 页并保存 \(listings.count) 个岗位。"
             )
             return .performed
@@ -3449,30 +3473,9 @@ final class BossAutomationController: ObservableObject {
                 break
             }
         }
-        if let apiError = error as? BossAPIError {
-            switch apiError {
-            case .httpStatus(429), .httpStatus(403):
-                return 24 * 60 * 60
-            case .httpStatus:
-                return nil
-            case .upstream(_, let code, let message):
-                let riskMarkers = [
-                    "频繁", "限流", "too many requests", "rate limit",
-                    "账号已封禁", "账号被封禁", "账号已冻结", "账号被冻结",
-                    "account suspended", "account banned"
-                ]
-                if code == 9 || riskMarkers.contains(where: {
-                    message.localizedCaseInsensitiveContains($0)
-                }) {
-                    return 24 * 60 * 60
-                }
-                // “开聊提醒”等业务拒绝不属于限流证据。
-                return nil
-            case .manualVerificationRequired:
-                return 24 * 60 * 60
-            case .invalidPayload, .invalidURL, .authenticationRequired, .webTokenExpired, .unsupported:
-                return nil
-            }
+        if let apiError = error as? BossAPIError,
+           BossServerFailurePolicy.requiresSafetyCooldown(apiError) {
+            return 24 * 60 * 60
         }
         return nil
     }
@@ -3785,7 +3788,11 @@ final class BossAutomationController: ObservableObject {
         // 回读重叠时间窗口，避免漏掉同秒记录和并发手动沟通。
         let lastSyncedAt = resumeExchanges ? store.dailyResumeExchangeLastSyncedAt(accountID: account.id)
             : store.dailyCommunicationLastSyncedAt(accountID: account.id)
-        let cutoff = max(startOfDay, (lastSyncedAt ?? startOfDay).addingTimeInterval(-120))
+        let needsRecipientBackfill = resumeExchanges && store.snapshot.dailyResumeExchangeRecords.contains {
+            $0.identityFingerprint == AutomaticGreetingSafetyRecord.identityFingerprint(remoteIdentityID: remoteIdentityID) &&
+            $0.attemptedAt >= startOfDay && $0.recipientFingerprint == nil
+        }
+        let cutoff = needsRecipientBackfill ? startOfDay : max(startOfDay, (lastSyncedAt ?? startOfDay).addingTimeInterval(-120))
         var credential = credential
         var previousOldest: Date?
         var previousPageIDs: [String]?
@@ -3834,11 +3841,45 @@ final class BossAutomationController: ObservableObject {
         throw BossAPIError.invalidPayload("今日互动列表尚未核对完整，稍后重新核对统计。")
     }
 
-    private func searchIsDue(
+    private func usesCandidateSupply(store: AppStore) -> Bool {
+        let settings = store.snapshot.automation
+        return settings.mode == .automatic && settings.automaticallySearchJobs &&
+            settings.automaticallyAssessJobs && settings.automaticallySendGreetings
+    }
+
+    private func candidateSupplyIsFull(accountID: UUID, store: AppStore) -> Bool {
+        usesCandidateSupply(store: store) && !JobDetailBatchPolicy.needsCandidates(
+            queuedCount: store.queuedAutomaticGreetingCandidateCount(accountID: accountID),
+            usedDailyQuota: store.automaticGreetingCountToday(accountID: accountID),
+            dailyLimit: store.snapshot.automation.dailyGreetingLimit
+        )
+    }
+
+    func shouldYieldToGreeting(accountID: UUID, store: AppStore) -> Bool {
+        guard usesCandidateSupply(store: store), store.snapshot.automation.workerEnabled,
+              store.hasQueuedAutomaticGreetingCandidate(accountID: accountID),
+              store.automaticGreetingCountToday(accountID: accountID) < store.snapshot.automation.dailyGreetingLimit
+        else { return false }
+        let now = Date()
+        guard automaticWritesAllowedAfter.map({ $0 > now }) != true,
+              dailyCommunicationRetryAt[accountID].map({ $0 > now }) != true else { return false }
+        return store.nextAutomaticGreetingAllowedAt(
+            accountID: accountID, intervalSeconds: store.snapshot.automation.greetingIntervalSeconds
+        ).map { $0 <= now } ?? true
+    }
+
+    func searchIsDue(
         accountID: UUID,
         store: AppStore,
         forceInitialSearch: Bool = false
     ) -> Bool {
+        guard !candidateSupplyIsFull(accountID: accountID, store: store) else { return false }
+        if usesCandidateSupply(store: store), !forceInitialSearch {
+            return AutomationWorkerSchedulePolicy.detailBacklogIsDue(
+                lastAttemptAt: detailBacklogAttemptAtByAccount[accountID], now: Date(),
+                intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds
+            )
+        }
         let regularSearchIsDue = AutomationWorkerSchedulePolicy.jobSearchIsDue(
             lastCompletedAt: effectiveLastSearchAt(accountID: accountID, store: store),
             intervalMinutes: effectiveSearchIntervalMinutes(accountID: accountID, store: store),
@@ -3863,6 +3904,7 @@ final class BossAutomationController: ObservableObject {
                 job.remoteJobID?.nilIfBlank != nil &&
                 job.securityID?.nilIfBlank != nil &&
                 job.listID?.nilIfBlank != nil &&
+                !JobMatchingPolicy.hasDefinitiveListMismatch(job: job, preferences: store.snapshot.preferences) &&
                 JobDetailBatchPolicy.canReadDetail(lastFailureAt: detailReadFailedAt[job.id])
         }
     }
@@ -3945,9 +3987,16 @@ final class BossAutomationController: ObservableObject {
         }
         if store.snapshot.automation.automaticallySearchJobs {
             let searchCandidates = activeAccounts.compactMap { account -> TimeInterval? in
+                guard !candidateSupplyIsFull(accountID: account.id, store: store) else { return nil }
                 guard let session = sessions.existingSession(for: account.id) else { return nil }
                 if session.phase.isAuthenticated, !session.automationReady { return 2 }
                 guard session.automationReady else { return nil }
+                if usesCandidateSupply(store: store) {
+                    return AutomationWorkerSchedulePolicy.secondsUntilDetailBacklogDue(
+                        lastAttemptAt: detailBacklogAttemptAtByAccount[account.id], now: now,
+                        intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds
+                    )
+                }
                 return AutomationWorkerSchedulePolicy.secondsUntilDue(
                     lastCompletedAt: effectiveLastSearchAt(accountID: account.id, store: store),
                     intervalMinutes: effectiveSearchIntervalMinutes(accountID: account.id, store: store),
@@ -3956,7 +4005,8 @@ final class BossAutomationController: ObservableObject {
             }
             candidateSeconds.append(contentsOf: searchCandidates)
             let backlogCandidates = activeAccounts.compactMap { account -> TimeInterval? in
-                guard hasPersistedDetailBacklog(accountID: account.id, store: store),
+                guard !usesCandidateSupply(store: store),
+                      hasPersistedDetailBacklog(accountID: account.id, store: store),
                       sessions.existingSession(for: account.id)?.automationReady == true else {
                     return nil
                 }

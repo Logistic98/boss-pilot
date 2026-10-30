@@ -2256,17 +2256,56 @@ final class AppStore: ObservableObject {
         let syncedIdentities = Set(snapshot.dailyResumeExchangeSyncedAt.filter {
             $0.value >= start && $0.value <= now
         }.keys)
-        // 官方已投递列表已含手动和工具发送，不再叠加工具账本。
-        let official = Set(snapshot.dailyResumeExchangeRecords.filter {
+        let official = snapshot.dailyResumeExchangeRecords.filter {
             (fingerprint != nil ? $0.identityFingerprint == fingerprint : fingerprints.contains($0.identityFingerprint)) &&
             syncedIdentities.contains($0.identityFingerprint) && $0.attemptedAt >= start && $0.attemptedAt <= now
-        }.map(\.id))
-        let unsyncedTool = snapshot.resumeDeliveryRecords.filter {
-            (identity != nil ? $0.remoteIdentityID == identity : identities.contains($0.remoteIdentityID)) &&
-            !syncedIdentities.contains(AutomaticGreetingSafetyRecord.identityFingerprint(remoteIdentityID: $0.remoteIdentityID)) &&
-            $0.resumeExchangeAt.map { $0 >= start && $0 <= now } == true
-        }.count
-        return official.count + unsyncedTool
+        }
+        var exchanges = Set(official.map(\.id))
+        let officialRecipients = Set(official.compactMap(\.recipientFingerprint))
+        let toolRecords = snapshot.resumeDeliveryRecords.filter { record in
+            guard identity != nil ? record.remoteIdentityID == identity : identities.contains(record.remoteIdentityID),
+                  let date = record.resumeExchangeAt, date >= start, date <= now else { return false }
+            // 已同步部分由官方列表覆盖，后续发送仍须立即补计。
+            let syncedAt = snapshot.dailyResumeExchangeSyncedAt[AutomaticGreetingSafetyRecord.identityFingerprint(remoteIdentityID: record.remoteIdentityID)]
+            return date > (syncedAt.flatMap { $0 >= start && $0 <= now ? $0 : nil } ?? .distantPast)
+        }
+        let accounts = snapshot.accounts.filter {
+            $0.remoteProfile?.remoteID.appStoreNonempty.map { identity != nil ? $0 == identity : identities.contains($0) } == true
+        }
+        let jobsByAccount = Dictionary(grouping: snapshot.jobs, by: \.accountID)
+            .mapValues { Dictionary(grouping: $0, by: { normalizedJobIdentity($0.company) }) }
+        var matchedToolIDs: Set<String> = []
+        for account in accounts {
+            guard let remoteIdentityID = account.remoteProfile?.remoteID.appStoreNonempty else { continue }
+            let accountTools = toolRecords.filter { $0.remoteIdentityID == remoteIdentityID }
+            for conversation in snapshot.conversations where conversation.accountID == account.id {
+                let aliases = Set([conversation.id, conversation.remoteConversationID].compactMap { $0 })
+                let tools = accountTools.filter { aliases.contains($0.conversationID) }
+                guard !tools.isEmpty || conversation.messages.contains(where: {
+                    $0.resumeAttachmentSentAt.map { $0 >= start && $0 <= now } == true
+                }) else { continue }
+                matchedToolIDs.formUnion(tools.map(\.id))
+                if let recipient = conversation.encryptedBossID?.appStoreNonempty,
+                   officialRecipients.contains(AutomaticGreetingAttempt.identifier(
+                    remoteIdentityID: remoteIdentityID, remoteJobID: "recipient:\(recipient)"
+                   )) { continue }
+                let jobIDs = (jobsByAccount[account.id]?[normalizedJobIdentity(conversation.company)] ?? [])
+                    .filter { conversationMatchesJob(conversation, job: $0) }
+                    .compactMap { $0.remoteJobID?.appStoreNonempty }
+                    .map { AutomaticGreetingAttempt.identifier(remoteIdentityID: remoteIdentityID, remoteJobID: $0) }
+                    .sorted()
+                // 官方与聊天可能返回不同路由，沿用岗位匹配；同一会话多条凭证只补计一次。
+                let key = jobIDs.first(where: { exchanges.contains($0) }) ?? jobIDs.first ??
+                    AutomaticGreetingAttempt.identifier(remoteIdentityID: remoteIdentityID, remoteJobID: "conversation:\(conversation.remoteConversationID ?? conversation.id)")
+                exchanges.insert(key)
+            }
+        }
+        for record in toolRecords where !matchedToolIDs.contains(record.id) {
+            exchanges.insert(AutomaticGreetingAttempt.identifier(
+                remoteIdentityID: record.remoteIdentityID, remoteJobID: "conversation:\(record.conversationID)"
+            ))
+        }
+        return exchanges.count
     }
 
     func nextAutomaticGreetingAllowedAt(accountID: UUID, intervalSeconds: Int) -> Date? {

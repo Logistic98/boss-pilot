@@ -74,6 +74,8 @@ struct SelfCheck {
         passed.append("resume exchange timestamps preserve send time and reject view time")
         try verifyCampusRecruitmentExclusions()
         passed.append("campus and internship exclusions at assessment and send boundaries")
+        try verifyCandidateSupply()
+        passed.append("candidate supply filters, bounded refill and immediate greeting handoff")
         try verifyGlobalAccountFilter()
         passed.append("global account multi-selection and default all")
 
@@ -5337,6 +5339,13 @@ struct SelfCheck {
             from: ["cardList": manualRows, "hasMore": false], remoteIdentityID: "manual-account"
         )
         try verify(parsedDaily.records.count == 2 && !parsedDaily.hasMore, "官方沟通列表未正确解析")
+        let parsedRecipient = try BossPayloadParser.dailyInteractions(from: [
+            "cardList": [["encryptJobId": "manual-role", "happenTime": manualTime.timeIntervalSince1970 * 1000,
+                          "encryptBossId": "manual-recipient"]], "hasMore": false
+        ], remoteIdentityID: "manual-account")
+        try verify(parsedRecipient.records.first?.recipientFingerprint == AutomaticGreetingAttempt.identifier(
+            remoteIdentityID: "manual-account", remoteJobID: "recipient:manual-recipient"
+        ), "官方投递招聘方标识未保留为去重指纹")
         for invalid: Any in [
             ["cardList": [], "hasMore": true],
             ["cardList": [["encryptJobId": "bad", "happenTime": true, "hasContact": 1]], "hasMore": false],
@@ -5782,6 +5791,120 @@ struct SelfCheck {
         }
         guard let completion else { task.cancel(); throw SelfCheckError.failed("后台响应测试超时") }
         try completion.get()
+    }
+
+    private static func verifyCandidateSupply() throws {
+        let now = Date()
+        try verify(
+            !AutomationWorkerSchedulePolicy.detailBacklogIsDue(
+                lastAttemptAt: now, now: now.addingTimeInterval(89),
+                intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds
+            ) && AutomationWorkerSchedulePolicy.detailBacklogIsDue(
+                lastAttemptAt: now, now: now.addingTimeInterval(90),
+                intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds
+            ) && AutomationWorkerSchedulePolicy.secondsUntilDetailBacklogDue(
+                lastAttemptAt: now, now: now.addingTimeInterval(45),
+                intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds
+            ) == 45 &&
+            JobDetailBatchPolicy.needsCandidates(queuedCount: 7, usedDailyQuota: 149, dailyLimit: 150) &&
+            !JobDetailBatchPolicy.needsCandidates(queuedCount: 8, usedDailyQuota: 0, dailyLimit: 150) &&
+            !JobDetailBatchPolicy.needsCandidates(queuedCount: 0, usedDailyQuota: 150, dailyLimit: 150),
+            "候选补货未遵守批次间隔、库存或每日额度"
+        )
+        var preferences = JobPreferences()
+        preferences.requirementText = "上海，其他城市不考虑，期望薪资20-30K，不考虑外包，必须 Kubernetes"
+        var listing = JobListing(id: "list-filter", accountID: UUID(), title: "Java", company: "示例公司",
+                                 location: "上海·浦东新区", salary: "20-30K")
+        try verify(!JobMatchingPolicy.hasDefinitiveListMismatch(job: listing, preferences: preferences),
+                   "缺少详情或必需关键词时被提前排除")
+        listing.salary = "10-15K"
+        try verify(JobMatchingPolicy.hasDefinitiveListMismatch(job: listing, preferences: preferences),
+                   "明确薪资不符仍占用详情请求")
+        listing.salary = "面议"
+        listing.location = "地点未标注"
+        try verify(!JobMatchingPolicy.hasDefinitiveListMismatch(job: listing, preferences: preferences),
+                   "未知薪资或地点被当作明确不合格")
+        listing.location = "全国"
+        try verify(!JobMatchingPolicy.hasDefinitiveListMismatch(job: listing, preferences: preferences),
+                   "全国地点被提前当作不符合严格城市要求")
+        listing.location = "北京"
+        try verify(JobMatchingPolicy.hasDefinitiveListMismatch(job: listing, preferences: preferences),
+                   "已知地点不符仍占用详情请求")
+        listing.location = "上海"
+        listing.title = "Java 外包工程师"
+        try verify(JobMatchingPolicy.hasDefinitiveListMismatch(job: listing, preferences: preferences),
+                   "明确排除项仍占用详情请求")
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("BossPilot-CandidateSupply-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let attachment = root.appendingPathComponent("resume.txt")
+        try Data("Java 后端开发".utf8).write(to: attachment)
+        var state = AppSnapshot()
+        state.resume.attachmentPath = attachment.path
+        var account = BossAccount(displayName: "候选供给测试")
+        var profile = BossAccountProfile()
+        profile.remoteID = "candidate-supply-identity"
+        account.remoteProfile = profile
+        account.loginStatus = .loggedIn
+        state.accounts = [account]
+        state.preferences.plannedSearchQueries = ["Java"]
+        state.preferences.minimumMatchScore = 40
+        state.automation.workerEnabled = true
+        state.automation.mode = .automatic
+        state.automation.automaticallySendGreetings = true
+        let persistence = JSONStatePersistence(fileURL: root.appendingPathComponent("state.json"))
+        try persistence.save(state)
+        let store = AppStore(persistence: persistence)
+        store.load()
+        let controller = BossAutomationController()
+        var job = JobListing(id: "supply-0", accountID: account.id, title: "Java", company: "示例公司",
+                             description: "列表摘要")
+        job.remoteJobID = "supply-remote-0"
+        job.securityID = "supply-security-0"
+        job.listID = "supply-list"
+        store.upsertJobs([job])
+        let summaryAssessments = try completePendingAssessments(store, accountID: account.id)
+        try verify(summaryAssessments == 0 && !controller.shouldYieldToGreeting(accountID: account.id, store: store) &&
+                   controller.searchIsDue(accountID: account.id, store: store),
+                   "摘要绕过完整详情门槛，或无候选时没有继续补货")
+        job.description = "负责 Java 后端服务开发及维护。"
+        job.detailFetchedAt = now
+        store.upsertJobs([job])
+        let readyAssessments = try completePendingAssessments(store, accountID: account.id)
+        try verify(readyAssessments == 1 && store.queuedAutomaticGreetingCandidateCount(accountID: account.id) == 1,
+                   "取得完整详情后没有立即进入合格候选队列")
+        try verify(controller.shouldYieldToGreeting(accountID: account.id, store: store),
+                   "已有就绪候选却没有让出开聊机会")
+        let moreJobs = (1..<8).map { index in
+            var next = job
+            next.id = "supply-\(index)"
+            next.remoteJobID = "supply-remote-\(index)"
+            return next
+        }
+        store.upsertJobs(moreJobs)
+        _ = try completePendingAssessments(store, accountID: account.id)
+        try verify(store.queuedAutomaticGreetingCandidateCount(accountID: account.id) == 8 &&
+                   !controller.searchIsDue(accountID: account.id, store: store, forceInitialSearch: true),
+                   "库存已满仍强制检索或读取详情")
+        try store.prepareAutomaticGreeting(jobID: job.id)
+        try verify(store.queuedAutomaticGreetingCandidateCount(accountID: account.id) == 7 &&
+                   controller.searchIsDue(accountID: account.id, store: store) &&
+                   !controller.shouldYieldToGreeting(accountID: account.id, store: store),
+                   "消费候选后未补货，或准备新候选时绕过开聊间隔")
+        store.updateAutomation { $0.dailyGreetingLimit = 1 }
+        try verify(!controller.searchIsDue(accountID: account.id, store: store),
+                   "今日额度已用完仍继续自动补货")
+        store.updateAutomation { $0.dailyGreetingLimit = 150 }
+        try verify(controller.searchIsDue(accountID: account.id, store: store),
+                   "恢复每日可用额度后未继续补货")
+
+        try verify(BossServerFailurePolicy.requiresSafetyCooldown(.httpStatus(429)) &&
+                   BossServerFailurePolicy.requiresSafetyCooldown(.httpStatus(403)) &&
+                   BossServerFailurePolicy.requiresSafetyCooldown(.upstream(
+                    operation: .accountResumeBase, code: 9, message: "访问风险"
+                   )) && !BossServerFailurePolicy.requiresSafetyCooldown(.httpStatus(500)),
+                   "可选资料与控制器未共用明确风险分类")
     }
 
     private static func completePendingAssessments(_ store: AppStore, accountID: UUID) throws -> Int {
@@ -7086,6 +7209,54 @@ struct SelfCheck {
         let reloaded = AppStore(persistence: persistence)
         reloaded.load()
         try verify(!reloaded.hasResumeExchange(for: job), "删除记录后重载又恢复了错误的交换状态")
+
+        job.remoteJobID = "manual-exchange-job"
+        fixture.jobs = [job]
+        var manualConversation = conversation
+        manualConversation.id = "boss-manual-without-job"
+        manualConversation.company = "无本地岗位的公司"
+        manualConversation.encryptedBossID = "manual-recipient"
+        manualConversation.messages = [summary, summary, viewed, request, failed]
+        var viewedOnly = conversation
+        viewedOnly.id = "boss-viewed-only"
+        viewedOnly.messages = [viewed, request, failed]
+        var foreignConversation = conversation
+        foreignConversation.id = "boss-foreign-exchange"
+        foreignConversation.accountID = UUID()
+        var unlistedConversation = manualConversation
+        unlistedConversation.id = "boss-manual-not-in-official-list"
+        unlistedConversation.encryptedBossID = "unlisted-recipient"
+        fixture.conversations = [conversation, manualConversation, unlistedConversation, viewedOnly, foreignConversation]
+        fixture.dailyResumeExchangeRecords = [AutomaticGreetingSafetyRecord(
+            remoteIdentityID: account.remoteProfile!.remoteID, remoteJobID: job.remoteJobID!, attemptedAt: attachmentSentAt
+        ), AutomaticGreetingSafetyRecord(
+            remoteIdentityID: account.remoteProfile!.remoteID, remoteJobID: "uncached-job", attemptedAt: attachmentSentAt,
+            remoteRecipientID: "manual-recipient"
+        )]
+        fixture.dailyResumeExchangeSyncedAt = [
+            AutomaticGreetingSafetyRecord.identityFingerprint(remoteIdentityID: account.remoteProfile!.remoteID): attachmentSentAt
+        ]
+        for conversationID in [conversation.id, "boss-tool-after-sync", "boss-tool-after-sync"] {
+            var delivery = ResumeDeliveryRecord(evidence: ResumeConsentEvidence(
+                accountID: accountID, remoteIdentityID: account.remoteProfile!.remoteID,
+                conversationID: conversationID, triggerRemoteMID: String(200 + fixture.resumeDeliveryRecords.count),
+                triggerTextDigest: String(repeating: "a", count: 64), receivedAt: attachmentSentAt,
+                exchangeKind: .acceptNativeRequest, nativeActionAID: 38, nativeScene: 1,
+                nativeDialogType: 2, nativeDialogWasOperated: false
+            ), attachmentSHA256: String(repeating: "b", count: 64), now: attachmentSentAt)
+            delivery.state = .serverAcceptedUnverified
+            delivery.serverAcceptedAt = attachmentSentAt.addingTimeInterval(60)
+            fixture.resumeDeliveryRecords.append(delivery)
+        }
+        try persistence.save(fixture)
+        let statisticsStore = AppStore(persistence: persistence)
+        statisticsStore.load()
+        try verify(statisticsStore.resumeExchangeCountToday(accountID: accountID, now: attachmentSentAt) == 3,
+                   "官方列表与手动附件未合并去重，或漏计无岗位的手动发送/误计查看与请求")
+        try verify(statisticsStore.resumeExchangeCountToday(accountID: accountID, now: attachmentSentAt.addingTimeInterval(600)) == 4,
+                   "同步后的工具发送未补计，或同一会话的多次投递被重复计数")
+        try verify(statisticsStore.resumeExchangeCountToday(accountID: accountID, now: attachmentSentAt.addingTimeInterval(86_400)) == 0,
+                   "手动附件交换统计未按发送日期重置")
     }
 
     private static func verifyListPerformance(
