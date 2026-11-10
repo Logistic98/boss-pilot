@@ -42,7 +42,7 @@ struct JobMatchingPolicy {
         var reasons: [String] = []
         var risks: [String] = []
 
-        let roleTerms = unique(preferences.plannedSearchQueries + resume.suggestedSearchQueries)
+        let roleTerms = targetRoleTerms(resume: resume, preferences: preferences)
         if roleTerms.isEmpty {
             risks.append("尚未设置目标岗位")
         } else if let role = roleTerms.first(where: { roleTerm($0, matchesTitle: job.title) }) {
@@ -306,13 +306,21 @@ struct JobMatchingPolicy {
         return normalizedText.contains(needle)
     }
 
+    static func targetRoleTerms(resume: ResumeProfile, preferences: JobPreferences) -> [String] {
+        let explicit = JobSearchPlanningPolicy.explicitRoleQueries(in: preferences.requirementText)
+        return explicit.isEmpty ? unique(preferences.plannedSearchQueries + resume.suggestedSearchQueries) : explicit
+    }
+
     /// 按岗位方向匹配，将“研发”和“开发”归一化；核心词至少两个字符，避免“工程师”等泛词误匹配。
-    private static func roleTerm(_ term: String, matchesTitle title: String) -> Bool {
+    static func roleTerm(_ term: String, matchesTitle title: String) -> Bool {
         let compactTerm = compactRoleText(term)
         let compactTitle = compactRoleText(title)
         guard !compactTerm.isEmpty, !compactTitle.isEmpty else { return false }
         if compactTitle.contains(compactTerm) { return true }
 
+        let engineeringTerms = ["工程师", "架构师", "研发", "开发", "全栈", "engineer", "developer", "architect"]
+        if engineeringTerms.contains(where: { compactTerm.contains($0) }),
+           !engineeringTerms.contains(where: { compactTitle.contains($0) }) { return false }
         let genericRoleWords = ["高级", "资深", "专家", "工程师", "研发", "开发", "岗位"]
         let core = genericRoleWords.reduce(compactTerm) { partial, word in
             partial.replacingOccurrences(of: word, with: "")
@@ -328,6 +336,8 @@ struct JobMatchingPolicy {
                 CharacterSet(charactersIn: "\u{4E00}-\u{9FFF}").contains($0)
         }
         return String(String.UnicodeScalarView(scalars))
+            .replacingOccurrences(of: "智能体", with: "agent")
+            .replacingOccurrences(of: "forwarddeployedengineer", with: "fde工程师")
     }
 
     private static func hasStrictLocationConstraint(_ text: String) -> Bool {

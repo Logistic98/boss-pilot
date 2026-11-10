@@ -26,7 +26,7 @@ enum JobSearchPlanningPolicy {
     }
 
     static func fallbackSearchPlan(resume: ResumeProfile, requirementText: String) -> JobSearchPlan {
-        let requirementQueries = roleQueries(in: requirementText)
+        let requirementQueries = explicitRoleQueries(in: requirementText) + roleQueries(in: requirementText)
         let queries = unique(requirementQueries + resume.suggestedSearchQueries + inferredRoleQueries(
             text: resume.text,
             skills: resume.skills
@@ -37,6 +37,22 @@ enum JobSearchPlanningPolicy {
             cities: cities.isEmpty ? ["全国"] : Array(cities.prefix(4)),
             provider: "本地解析"
         )
+    }
+
+    static func explicitRoleQueries(in text: String) -> [String] {
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard let heading = line.range(
+                of: #"^\s*(?:\d+\s*[、.．]\s*)?(?:目标岗位|岗位)\s*[:：]\s*"#,
+                options: .regularExpression
+            ) else { continue }
+            let titles = line[heading.upperBound...].replacingOccurrences(
+                of: #"\s{2,}.*$"#, with: "", options: .regularExpression
+            )
+            let names = unique(titles.components(separatedBy: CharacterSet(charactersIn: "/／、，,。；;")))
+                .filter { (2...40).contains($0.count) }
+            if !names.isEmpty { return Array(names.prefix(4)) }
+        }
+        return []
     }
 
     static func normalizedSearchPlan(

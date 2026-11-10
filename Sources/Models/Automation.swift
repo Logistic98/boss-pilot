@@ -21,6 +21,7 @@ struct BossJobSearchPaginationState: Identifiable, Codable, Hashable, Sendable {
     var planFingerprint: String
     var nextPage: Int
     var updatedAt: Date
+    var nextTargetIndex: Int? = nil
 
     var id: String {
         let material = [accountID.uuidString, planFingerprint].joined(separator: "|")
@@ -86,7 +87,8 @@ struct AutomationSettings: Codable, Hashable {
     static let monitorIntervalMinutesRange = 30...180
     static let searchIntervalMinutesRange = 30...360
     static let dailyGreetingLimitRange = 1...150
-    static let greetingIntervalSecondsRange = 180...1_800
+    static let fastGreetingIntervalSeconds = 30
+    static let greetingIntervalSecondsRange = fastGreetingIntervalSeconds...1_800
     static let defaultDailyGreetingLimit = 150
     static let defaultMonitorIntervalMinutes = 60
     static let defaultSearchIntervalMinutes = 60
@@ -112,6 +114,9 @@ struct AutomationSettings: Codable, Hashable {
     var allowsDrafting: Bool { mode != .remindersOnly }
     var allowsConnectorReads: Bool { mode != .remindersOnly }
     var allowsExternalActions: Bool { mode == .automatic }
+    var usesFastGreetingPacing: Bool {
+        automaticallySendGreetings && greetingIntervalSeconds < Self.defaultGreetingIntervalSeconds
+    }
 
     enum CodingKeys: String, CodingKey {
         case mode
@@ -183,7 +188,8 @@ struct AutomationSettings: Codable, Hashable {
     }
 
     static func normalizedGreetingIntervalSeconds(_ value: Int) -> Int {
-        min(greetingIntervalSecondsRange.upperBound, max(greetingIntervalSecondsRange.lowerBound, value))
+        guard value > 0 else { return defaultGreetingIntervalSeconds }
+        return min(greetingIntervalSecondsRange.upperBound, max(greetingIntervalSecondsRange.lowerBound, value))
     }
 
     mutating func enforceAutomaticModeCapabilities() {
@@ -209,11 +215,19 @@ struct AutomationSettings: Codable, Hashable {
         }?.updatedAt
     }
 
+    func nextJobSearchTargetIndex(accountID: UUID, planFingerprint: String, targetCount: Int) -> Int {
+        let index = jobSearchPaginationStates.first {
+            $0.accountID == accountID && $0.planFingerprint == planFingerprint
+        }?.nextTargetIndex ?? 0
+        return index >= 0 && index < targetCount ? index : 0
+    }
+
     mutating func recordCompletedJobSearchPage(
         accountID: UUID,
         planFingerprint: String,
         completedPage: Int,
-        now: Date = Date()
+        now: Date = Date(),
+        nextTargetIndex: Int? = nil
     ) {
         let normalizedFingerprint = planFingerprint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedFingerprint.isEmpty else { return }
@@ -222,8 +236,11 @@ struct AutomationSettings: Codable, Hashable {
             BossJobSearchPaginationState(
                 accountID: accountID,
                 planFingerprint: normalizedFingerprint,
-                nextPage: BossJobSearchPaginationPolicy.page(after: completedPage),
-                updatedAt: now
+                nextPage: nextTargetIndex == nil
+                    ? BossJobSearchPaginationPolicy.page(after: completedPage)
+                    : BossJobSearchPaginationPolicy.normalizedPage(completedPage),
+                updatedAt: now,
+                nextTargetIndex: nextTargetIndex
             )
         )
         jobSearchPaginationStates.sort { $0.accountID.uuidString < $1.accountID.uuidString }
@@ -352,6 +369,8 @@ struct AutomaticGreetingSafetyRecord: Identifiable, Codable, Hashable {
 
 enum AutomaticGreetingPacingPolicy {
     static let maximumJitterSeconds = 15
+    static let unconfirmedWritePauseSeconds: TimeInterval = 90
+    static let fastPreflightLeadSeconds: TimeInterval = 8
 
     static func nextAllowedAt(
         after record: AutomaticGreetingSafetyRecord,
@@ -359,7 +378,8 @@ enum AutomaticGreetingPacingPolicy {
     ) -> Date {
         let normalizedSeconds = AutomationSettings.normalizedGreetingIntervalSeconds(intervalSeconds)
         let stableHash = UInt64(StableIdentifier.fnv1a64(record.id), radix: 16) ?? 0
-        let jitterSeconds = Int(stableHash % UInt64(maximumJitterSeconds + 1))
+        let jitterLimit = normalizedSeconds < AutomationSettings.defaultGreetingIntervalSeconds ? 5 : maximumJitterSeconds
+        let jitterSeconds = Int(stableHash % UInt64(jitterLimit + 1))
         return record.attemptedAt.addingTimeInterval(
             TimeInterval(normalizedSeconds + jitterSeconds)
         )
@@ -370,6 +390,7 @@ enum JobDetailBatchPolicy {
     static let maximumDetailsPerPass = 4
     static let minimumPersistedBacklogShare = 1
     static let candidateBufferSize = 8
+    static let candidateBacklogMaxAgeSeconds: TimeInterval = 24 * 60 * 60
 
     static func needsCandidates(queuedCount: Int, usedDailyQuota: Int, dailyLimit: Int) -> Bool {
         queuedCount < candidateBufferSize && usedDailyQuota < dailyLimit
@@ -379,12 +400,20 @@ enum JobDetailBatchPolicy {
         lastFailureAt.map { now.timeIntervalSince($0) >= 15 * 60 } ?? true
     }
 
-    static func priorityScores(jobs: [JobListing], preferences: JobPreferences) throws -> [String: Int] {
+    static func priorityScores(
+        jobs: [JobListing], preferences: JobPreferences, roleTerms: [String] = []
+    ) throws -> [String: Int] {
         var scores: [String: Int] = [:]
         for job in jobs {
             try Task.checkCancellation()
             guard let remoteJobID = job.remoteJobID else { continue }
-            scores[remoteJobID] = JobMatchingPolicy.hardGateFailures(job: job, preferences: preferences).count
+            let failures = JobMatchingPolicy.hardGateFailures(job: job, preferences: preferences).count
+            if roleTerms.isEmpty {
+                scores[remoteJobID] = failures
+            } else {
+                let matchesRole = roleTerms.contains { JobMatchingPolicy.roleTerm($0, matchesTitle: job.title) }
+                scores[remoteJobID] = failures * 2 + (matchesRole ? 0 : 1)
+            }
         }
         return scores
     }
@@ -424,6 +453,8 @@ enum BossRequestPacingPolicy {
     static let maximumReadJitterSeconds = 2
     static let minimumWriteIntervalSeconds: TimeInterval = 60
     static let maximumWriteJitterSeconds = 4
+    static let fastReadIntervalSeconds: TimeInterval = 2
+    static let fastWriteIntervalSeconds: TimeInterval = 5
 
     static func nextAllowedAt(
         lastDispatchedAt: Date?,
@@ -431,20 +462,23 @@ enum BossRequestPacingPolicy {
         isWrite: Bool,
         readJitter: Int,
         writeJitter: Int,
-        now: Date
+        now: Date,
+        expedited: Bool = false
     ) -> Date {
+        let readInterval = expedited ? fastReadIntervalSeconds : minimumReadIntervalSeconds
+        let writeInterval = expedited ? fastWriteIntervalSeconds : minimumWriteIntervalSeconds
         let requestDue = lastDispatchedAt?.addingTimeInterval(
-            minimumReadIntervalSeconds + TimeInterval(readJitter)
+            readInterval + TimeInterval(readJitter)
         ) ?? now
         guard isWrite else { return requestDue }
         let writeDue = lastWriteAt?.addingTimeInterval(
-            minimumWriteIntervalSeconds + TimeInterval(writeJitter)
+            writeInterval + TimeInterval(writeJitter)
         ) ?? now
         return max(requestDue, writeDue)
     }
 
-    static func jitterSeconds(discriminator: String, sequence: UInt64, isWrite: Bool) -> Int {
-        let ceiling = isWrite ? maximumWriteJitterSeconds : maximumReadJitterSeconds
+    static func jitterSeconds(discriminator: String, sequence: UInt64, isWrite: Bool, expedited: Bool = false) -> Int {
+        let ceiling = expedited ? 1 : (isWrite ? maximumWriteJitterSeconds : maximumReadJitterSeconds)
         let stableHash = UInt64(
             StableIdentifier.fnv1a64("\(discriminator)|\(sequence)"),
             radix: 16
@@ -459,6 +493,11 @@ enum AutomationWorkerSchedulePolicy {
     static let responsiveWakeFloorSeconds: TimeInterval = 0.25
     static let detailBacklogRetrySeconds: TimeInterval = 15 * 60
     static let candidateReplenishmentIntervalSeconds: TimeInterval = 90
+    static let fastCandidateReplenishmentIntervalSeconds: TimeInterval = 10
+
+    static func candidateReplenishmentIntervalSeconds(expedited: Bool) -> TimeInterval {
+        expedited ? fastCandidateReplenishmentIntervalSeconds : candidateReplenishmentIntervalSeconds
+    }
 
     static func secondsUntilDue(
         lastCompletedAt: Date?,
@@ -491,11 +530,12 @@ enum AutomationWorkerSchedulePolicy {
 
     static func secondsUntilDetailBacklogDue(
         lastAttemptAt: Date?, now: Date,
-        intervalSeconds: TimeInterval = detailBacklogRetrySeconds
+        intervalSeconds: TimeInterval = detailBacklogRetrySeconds,
+        minimumSeconds: TimeInterval = retryFloorSeconds
     ) -> TimeInterval {
-        guard let lastAttemptAt else { return retryFloorSeconds }
+        guard let lastAttemptAt else { return minimumSeconds }
         return max(
-            retryFloorSeconds,
+            minimumSeconds,
             intervalSeconds - now.timeIntervalSince(lastAttemptAt)
         )
     }

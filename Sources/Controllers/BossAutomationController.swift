@@ -213,7 +213,10 @@ final class BossAutomationController: ObservableObject {
                   self.workerGeneration == generation,
                   store.snapshot.automation.workerEnabled,
                   store.snapshot.automation.mode == .automatic {
-                let cycleResult = await self.runCycleIfAvailable(using: store, sessions: sessions, codex: codex)
+                let cycleResult = await self.runCycleIfAvailable(
+                    using: store, sessions: sessions, codex: codex,
+                    independently: store.snapshot.automation.usesFastGreetingPacing
+                )
                 if cycleResult == .busy || cycleResult == .waitingForSession {
                     do {
                         let delay: UInt64 = cycleResult == .busy ? 500_000_000 : 2_000_000_000
@@ -423,7 +426,8 @@ final class BossAutomationController: ObservableObject {
     private func runCycleIfAvailable(
         using store: AppStore,
         sessions: BossSessionCoordinator,
-        codex: CodexController
+        codex: CodexController,
+        independently: Bool = false
     ) async -> CycleResult {
         guard !terminationRequested else { return .ineligible }
         guard !isManualSyncRunning else { return .busy }
@@ -461,6 +465,19 @@ final class BossAutomationController: ObservableObject {
             automaticResumeWritePermitAccountIDs.removeAll()
             isCycleRunning = false
         }
+        if independently {
+            let accountIDs = Set(activeAccounts.map(\.id))
+            await withTaskGroup(of: Void.self) { group in
+                for account in activeAccounts {
+                    group.addTask { @MainActor in
+                        await self.runIndependentAccount(
+                            account.id, accountIDs: accountIDs, store: store, sessions: sessions, codex: codex
+                        )
+                    }
+                }
+            }
+            return .busy
+        }
         var readyAccountCount = 0
         var encounteredBusyAccount = false
         var encounteredManualVerification = false
@@ -495,11 +512,6 @@ final class BossAutomationController: ObservableObject {
                 : .waitingForSession
         }
 
-        if store.snapshot.automation.automaticallyMonitorMessages,
-           store.snapshot.automation.automaticallySendResume {
-            automaticResumeWritePermitAccountIDs = Set(readySessions.map { $0.account.id })
-        }
-
         // 账号内串行以保护会话和额度，不同账号可交错等待网络结果。
         let accountResults = await withTaskGroup(of: AccountCycleResult.self) { group in
             for (account, session) in readySessions {
@@ -528,6 +540,48 @@ final class BossAutomationController: ObservableObject {
         return .performed
     }
 
+    private func runIndependentAccount(
+        _ accountID: UUID,
+        accountIDs: Set<UUID>,
+        store: AppStore,
+        sessions: BossSessionCoordinator,
+        codex: CodexController
+    ) async {
+        let clock = ContinuousClock()
+        var nextRun = clock.now
+        while !Task.isCancelled, !isManualSyncRunning,
+              store.snapshot.automation.workerEnabled, store.snapshot.automation.usesFastGreetingPacing,
+              Set(Self.workerScheduleEligibleAccounts(store.snapshot.accounts).map(\.id)) == accountIDs,
+              connectorRequestsAllowed(accountID: accountID, store: store) {
+            let remaining = clock.now.duration(to: nextRun)
+            if remaining > .zero {
+                do { try await clock.sleep(for: min(remaining, .seconds(1))) }
+                catch { return }
+                continue
+            }
+            guard let account = store.snapshot.accounts.first(where: { $0.id == accountID }) else { return }
+            let session = sessions.session(for: account)
+            await session.restoreIfNeeded()
+            guard !Task.isCancelled, !isManualSyncRunning else { return }
+            if !session.automationReady {
+                statusByAccount[account.id] = session.phase.isAuthenticated ? "接口会话正在准备" : "等待扫码登录"
+                nextRun = clock.now.advanced(by: .seconds(2))
+                continue
+            }
+            let result = await runAutomaticAccountLane(
+                account: account, session: session, store: store, codex: codex,
+                forceInitialSearch: forceSearchAccountIDs.contains(account.id)
+            )
+            guard !Task.isCancelled else { return }
+            if result.attemptedInitialSearch { forceSearchAccountIDs.remove(account.id) }
+            lastCycleAt = Date()
+            let delay = result.encounteredBusy ? 500_000_000 : nextWorkerDelayNanoseconds(
+                store: store, sessions: sessions, accountID: account.id
+            )
+            nextRun = clock.now.advanced(by: .nanoseconds(Int64(delay)))
+        }
+    }
+
     private func runAutomaticAccountLane(
         account: BossAccount,
         session: BossAccountSessionController,
@@ -541,8 +595,9 @@ final class BossAutomationController: ObservableObject {
             return result
         }
 
+        let expediteGreetings = store.snapshot.automation.usesFastGreetingPacing
         if !session.profileBindingVerified || profileSyncIsDue(accountID: account.id, store: store) {
-            let profileOutcome = if forceInitialSearch,
+            let profileOutcome = if forceInitialSearch || expediteGreetings,
                                     !session.profileBindingVerified,
                                     store.snapshot.accounts.first(where: { $0.id == account.id })?
                                         .remoteProfile?.remoteID.nilIfBlank != nil {
@@ -593,11 +648,9 @@ final class BossAutomationController: ObservableObject {
         var greetingPerformed = false
         if store.snapshot.automation.allowsExternalActions,
            store.snapshot.automation.automaticallySendGreetings {
-            let greetingOutcome = await sendNextQualifiedGreeting(
-                account: account,
-                session: session,
-                store: store
-            )
+            let greetingOutcome = await BossNetworkPacingGate.$expedited.withValue(expediteGreetings) {
+                await sendNextQualifiedGreeting(account: account, session: session, store: store)
+            }
             if greetingOutcome == .busy {
                 result.encounteredBusy = true
                 return result
@@ -607,22 +660,14 @@ final class BossAutomationController: ObservableObject {
             }
         }
 
-        // 招聘方回复优先于岗位详情读取和 Codex 评估。
-        if store.snapshot.automation.automaticallyMonitorMessages,
-           !Task.isCancelled,
-           messageSyncIsDue(accountID: account.id, store: store),
-           await synchronizeMessages(
-               account: account,
-               session: session,
-               store: store,
-               allowExternalActions: true
-           ) == .busy {
-            statusByAccount[account.id] = "等待该账号的当前任务完成"
+        if !expediteGreetings, await synchronizeMessagesIfDue(account: account, session: session, store: store) {
             result.encounteredBusy = true
             return result
         }
 
-        if !greetingPerformed,
+        let canReplenishDuringGreetingInterval = expediteGreetings &&
+            !shouldYieldToGreeting(accountID: account.id, store: store)
+        if (!greetingPerformed || canReplenishDuringGreetingInterval),
            store.snapshot.automation.automaticallySearchJobs,
            !Task.isCancelled,
            searchIsDue(
@@ -630,25 +675,25 @@ final class BossAutomationController: ObservableObject {
                store: store,
                forceInitialSearch: forceInitialSearch
            ) {
+            let refreshEmptyQueue = expediteGreetings &&
+                !store.hasQueuedAutomaticGreetingCandidate(accountID: account.id) &&
+                Date().timeIntervalSince(lastSearchAtByAccount[account.id] ?? .distantPast) >=
+                    AutomationWorkerSchedulePolicy.pollingCeilingSeconds
             let detailBacklogOnly = usesCandidateSupply(store: store)
-                ? !forceInitialSearch && hasPersistedDetailBacklog(accountID: account.id, store: store)
+                ? !forceInitialSearch && !refreshEmptyQueue && hasPersistedDetailBacklog(accountID: account.id, store: store)
                 : !AutomationWorkerSchedulePolicy.jobSearchIsDue(
                     lastCompletedAt: effectiveLastSearchAt(accountID: account.id, store: store),
                     intervalMinutes: effectiveSearchIntervalMinutes(accountID: account.id, store: store),
                     forceInitialSearch: forceInitialSearch,
                     now: Date()
                 )
-            let searchOutcome = await searchJobs(
-                account: account,
-                session: session,
-                store: store,
-                codex: codex,
-                useCodex: true,
-                allowExternalActions: false,
-                startupQuickPass: forceInitialSearch,
-                detailBacklogOnly: detailBacklogOnly,
-                prioritizeGreetings: true
-            )
+            let searchOutcome = await BossNetworkPacingGate.$expedited.withValue(expediteGreetings) {
+                await searchJobs(
+                    account: account, session: session, store: store, codex: codex,
+                    useCodex: true, allowExternalActions: false, startupQuickPass: forceInitialSearch,
+                    detailBacklogOnly: detailBacklogOnly, prioritizeGreetings: true
+                )
+            }
             if searchOutcome == .performed {
                 result.attemptedInitialSearch = forceInitialSearch
             } else if searchOutcome == .busy {
@@ -663,18 +708,35 @@ final class BossAutomationController: ObservableObject {
            store.snapshot.automation.allowsExternalActions,
            store.snapshot.automation.automaticallySendGreetings,
            !Task.isCancelled {
-            let greetingOutcome = await sendNextQualifiedGreeting(
-                account: account,
-                session: session,
-                store: store
-            )
+            let greetingOutcome = await BossNetworkPacingGate.$expedited.withValue(expediteGreetings) {
+                await sendNextQualifiedGreeting(account: account, session: session, store: store)
+            }
             if greetingOutcome == .busy {
                 result.encounteredBusy = true
                 return result
             }
         }
 
+        if expediteGreetings, await synchronizeMessagesIfDue(account: account, session: session, store: store) {
+            result.encounteredBusy = true
+        }
         return result
+    }
+
+    private func synchronizeMessagesIfDue(
+        account: BossAccount, session: BossAccountSessionController, store: AppStore
+    ) async -> Bool {
+        guard store.snapshot.automation.automaticallyMonitorMessages, !Task.isCancelled, !isManualSyncRunning,
+              messageSyncIsDue(accountID: account.id, store: store) else { return false }
+        if store.snapshot.automation.automaticallySendResume {
+            automaticResumeWritePermitAccountIDs.insert(account.id)
+        }
+        defer { automaticResumeWritePermitAccountIDs.remove(account.id) }
+        let busy = await synchronizeMessages(
+            account: account, session: session, store: store, allowExternalActions: true
+        ) == .busy
+        if busy { statusByAccount[account.id] = "等待该账号的当前任务完成" }
+        return busy
     }
 
     @discardableResult
@@ -703,9 +765,10 @@ final class BossAutomationController: ObservableObject {
         guard await ensureProfileBinding(account: account, session: session, store: store) else { return .unavailable }
         guard let identityRevision = session.currentIdentityRevision(requiringProfileBinding: true) else { return .unavailable }
         guard let operationGeneration = beginOperation(accountID: account.id, profileID: account.webProfileID) else { return .busy }
+        let fastBatch = prioritizeGreetings && BossNetworkPacingGate.expedited
+        if fastBatch { detailBacklogAttemptAtByAccount[account.id] = Date() }
         defer {
-            // 从批次完成计时，避免慢请求结束后立即连续补货。
-            detailBacklogAttemptAtByAccount[account.id] = Date()
+            if !fastBatch { detailBacklogAttemptAtByAccount[account.id] = Date() }
             finishOperation(accountID: account.id, generation: operationGeneration)
         }
         do {
@@ -731,9 +794,22 @@ final class BossAutomationController: ObservableObject {
                 accountID: account.id,
                 planFingerprint: searchPlanFingerprint
             )
-            let activeSearchTargets = detailBacklogOnly ? [] : (startupQuickPass
-                ? Array(searchTargets.prefix(1))
-                : searchTargets)
+            let staggerTargets = BossNetworkPacingGate.expedited
+            let orderedTargets = staggerTargets
+                ? searchTargets.sorted { ($0.query, $0.cityCode) < ($1.query, $1.cityCode) }
+                : searchTargets
+            let targetIndex = store.snapshot.automation.nextJobSearchTargetIndex(
+                accountID: account.id, planFingerprint: searchPlanFingerprint, targetCount: orderedTargets.count
+            )
+            let activeSearchTargets = if detailBacklogOnly {
+                [BossJobSearchTarget]()
+            } else if staggerTargets {
+                [orderedTargets[targetIndex]]
+            } else if startupQuickPass {
+                Array(orderedTargets.prefix(1))
+            } else {
+                orderedTargets
+            }
             statusByAccount[account.id] = startupQuickPass
                 ? "正在获取首批岗位·第 \(searchPage) 页"
                 : "正在低频检索 \(activeSearchTargets.count) 组岗位条件·第 \(searchPage) 页"
@@ -806,9 +882,12 @@ final class BossAutomationController: ObservableObject {
                 uniquingKeysWith: { first, _ in first }
             )
             let currentRemoteJobIDs = Set(remoteJobs.compactMap { $0.remoteJobID.nilIfBlank })
+            let oldestBacklogDate = prioritizeGreetings && usesCandidateSupply(store: store)
+                ? Date().addingTimeInterval(-JobDetailBatchPolicy.candidateBacklogMaxAgeSeconds) : .distantPast
             var persistedDetailBacklog = store.snapshot.jobs.filter { job in
                 job.accountID == account.id &&
                     job.stage == .discovered &&
+                    job.capturedAt >= oldestBacklogDate &&
                     !job.hasCachedDetail &&
                     job.remoteJobID?.nilIfBlank != nil &&
                     job.securityID?.nilIfBlank != nil &&
@@ -819,9 +898,14 @@ final class BossAutomationController: ObservableObject {
             }
             let priorityJobs = remoteJobs.map { $0.listing(accountID: account.id, detailFetchedAt: nil) } + persistedDetailBacklog
             let priorityPreferences = store.snapshot.preferences
+            let roleTerms = fastBatch
+                ? JobMatchingPolicy.targetRoleTerms(resume: store.snapshot.resume, preferences: priorityPreferences)
+                : []
             // 在后台为每个岗位解析一次要求，避免在排序比较器中重复计算。
             let priorityTask = Task.detached(priority: .utility) {
-                try JobDetailBatchPolicy.priorityScores(jobs: priorityJobs, preferences: priorityPreferences)
+                try JobDetailBatchPolicy.priorityScores(
+                    jobs: priorityJobs, preferences: priorityPreferences, roleTerms: roleTerms
+                )
             }
             let scores = try await withTaskCancellationHandler {
                 try await priorityTask.value
@@ -835,12 +919,13 @@ final class BossAutomationController: ObservableObject {
                 let left = scores[lhs.remoteJobID ?? "", default: Int.max]
                 let right = scores[rhs.remoteJobID ?? "", default: Int.max]
                 if left != right { return left < right }
-                if lhs.capturedAt != rhs.capturedAt { return lhs.capturedAt < rhs.capturedAt }
+                if lhs.capturedAt != rhs.capturedAt { return lhs.capturedAt > rhs.capturedAt }
                 return lhs.id < rhs.id
             }
             let currentDetailReadAllowed = remoteJobs.map {
                 let listing = $0.listing(accountID: account.id)
-                return !JobMatchingPolicy.hasDefinitiveListMismatch(job: listing, preferences: store.snapshot.preferences) &&
+                return existingJobsByRemoteID[$0.remoteJobID]?.stage != .closed &&
+                    !JobMatchingPolicy.hasDefinitiveListMismatch(job: listing, preferences: store.snapshot.preferences) &&
                     JobDetailBatchPolicy.canReadDetail(lastFailureAt: detailReadFailedAt[listing.id])
             }
             let currentPendingDetailCount = remoteJobs.indices.filter {
@@ -933,7 +1018,12 @@ final class BossAutomationController: ObservableObject {
                         throw error
                     }
                     if Self.safetyCooldownSeconds(for: error) != nil { throw error }
-                    detailReadFailedAt[remoteJobs[index].listing(accountID: account.id).id] = Date()
+                    let jobID = remoteJobs[index].listing(accountID: account.id).id
+                    if case .upstream(.jobDetail, 200301, _) = error {
+                        store.markJobUnavailable(id: jobID, securityID: remoteJobs[index].securityID)
+                    } else {
+                        detailReadFailedAt[jobID] = Date()
+                    }
                     store.addActivity(
                         accountID: account.id,
                         level: .warning,
@@ -1011,7 +1101,11 @@ final class BossAutomationController: ObservableObject {
                 } catch let error as BossAPIError {
                     if case .manualVerificationRequired = error { throw error }
                     if Self.safetyCooldownSeconds(for: error) != nil { throw error }
-                    detailReadFailedAt[persistedJob.id] = Date()
+                    if case .upstream(.jobDetail, 200301, _) = error {
+                        store.markJobUnavailable(id: persistedJob.id, securityID: securityID)
+                    } else {
+                        detailReadFailedAt[persistedJob.id] = Date()
+                    }
                     store.addActivity(
                         accountID: account.id,
                         level: .warning,
@@ -1063,7 +1157,8 @@ final class BossAutomationController: ObservableObject {
                     $0.recordCompletedJobSearchPage(
                         accountID: account.id,
                         planFingerprint: searchPlanFingerprint,
-                        completedPage: searchPage
+                        completedPage: searchPage,
+                        nextTargetIndex: staggerTargets && targetIndex + 1 < orderedTargets.count ? targetIndex + 1 : nil
                     )
                 }
             }
@@ -1111,7 +1206,6 @@ final class BossAutomationController: ObservableObject {
             ) else { return .unavailable }
             if startupQuickPass {
                 lastSearchAtByAccount[account.id] = Date()
-                detailBacklogAttemptAtByAccount[account.id] = Date()
             } else if !detailBacklogOnly {
                 lastSearchAtByAccount[account.id] = Date()
             }
@@ -2935,9 +3029,13 @@ final class BossAutomationController: ObservableObject {
     func synchronizeProfile(
         account: BossAccount,
         session: BossAccountSessionController,
-        store: AppStore
+        store: AppStore,
+        reuseFreshProfile: Bool = false
     ) async -> AccountOperationOutcome {
-        await performProfileSynchronization(
+        if reuseFreshProfile, !session.profileBindingVerified, !profileSyncIsDue(accountID: account.id, store: store) {
+            return await verifyPersistedProfileBinding(account: account, session: session, store: store)
+        }
+        return await performProfileSynchronization(
             account: account,
             session: session,
             store: store,
@@ -3161,10 +3259,12 @@ final class BossAutomationController: ObservableObject {
             statusByAccount[account.id] = "今日打招呼已达上限"
             return .unavailable
         }
-        if let nextAllowedAt = store.nextAutomaticGreetingAllowedAt(
+        let nextAllowedAt = store.nextAutomaticGreetingAllowedAt(
             accountID: account.id,
             intervalSeconds: store.snapshot.automation.greetingIntervalSeconds
-        ), nextAllowedAt > Date() {
+        ) ?? .distantPast
+        let preflightLead = BossNetworkPacingGate.expedited ? AutomaticGreetingPacingPolicy.fastPreflightLeadSeconds : 0
+        if nextAllowedAt.timeIntervalSinceNow > preflightLead {
             statusByAccount[account.id] = "下一次开聊最早于 \(nextAllowedAt.formatted(date: .omitted, time: .shortened))"
             return .unavailable
         }
@@ -3214,6 +3314,7 @@ final class BossAutomationController: ObservableObject {
             }
             var credential = try session.credential()
             guard credential.isAutomationReady else { throw BossAutomationError.incompleteWebCredential }
+            let preflightStartedAt = Date()
             do {
                 credential = try await refreshDailyInteractions(
                     account: account, session: session, store: store,
@@ -3227,6 +3328,14 @@ final class BossAutomationController: ObservableObject {
                 }
                 throw error
             }
+            let reservationDelay = nextAllowedAt.timeIntervalSinceNow
+            if reservationDelay > 0 {
+                try await Task.sleep(for: .seconds(reservationDelay))
+            }
+            guard operationIsCurrent(
+                accountID: account.id, generation: operationGeneration, store: store,
+                session: session, identityRevision: identityRevision
+            ), Calendar.current.isDateInToday(preflightStartedAt) else { return .unavailable }
             guard store.automaticGreetingCountToday(accountID: account.id) < dailyLimit,
                   !store.hasAutomaticGreetingAttempt(accountID: account.id, remoteJobID: remoteJobID) else {
                 statusByAccount[account.id] = "手动与工具沟通已核对；本岗位已沟通或今日额度已用完"
@@ -3262,11 +3371,15 @@ final class BossAutomationController: ObservableObject {
             ) else {
                 return .unavailable
             }
+            let writeInterval = TimeInterval(store.snapshot.automation.greetingIntervalSeconds)
+            let notBefore = store.latestAutomaticGreetingWrite(accountID: account.id)?.deliveryWriteStartedAt?
+                .addingTimeInterval(writeInterval) ?? .distantPast
             let receipt = try await resumeExchange.sendGreetingAndConfirm(
                 profileID: account.webProfileID,
                 expectedSecurityID: securityID,
                 expectedJobID: remoteJobID,
                 text: greetingText,
+                notBefore: notBefore,
                 commitIsStillAuthorized: { [weak self, weak store, weak session] in
                     guard let self, let store, let session else { return false }
                     return self.operationIsCurrent(
@@ -3727,6 +3840,8 @@ final class BossAutomationController: ObservableObject {
     }
 
     private func searchQueries(store: AppStore) -> [String] {
+        let explicit = JobSearchPlanningPolicy.explicitRoleQueries(in: store.snapshot.preferences.requirementText)
+        if !explicit.isEmpty { return explicit }
         let fallback = JobSearchPlanningPolicy.fallbackSearchPlan(
             resume: store.snapshot.resume,
             requirementText: store.snapshot.preferences.requirementText
@@ -3830,17 +3945,17 @@ final class BossAutomationController: ObservableObject {
         )
     }
 
-    func shouldYieldToGreeting(accountID: UUID, store: AppStore) -> Bool {
+    func shouldYieldToGreeting(accountID: UUID, store: AppStore, now: Date = Date()) -> Bool {
         guard usesCandidateSupply(store: store), store.snapshot.automation.workerEnabled,
               store.hasQueuedAutomaticGreetingCandidate(accountID: accountID),
               store.automaticGreetingCountToday(accountID: accountID) < store.snapshot.automation.dailyGreetingLimit
         else { return false }
-        let now = Date()
         guard automaticWritesAllowedAfter.map({ $0 > now }) != true,
               dailyCommunicationRetryAt[accountID].map({ $0 > now }) != true else { return false }
+        let lead = store.snapshot.automation.usesFastGreetingPacing ? AutomaticGreetingPacingPolicy.fastPreflightLeadSeconds : 0
         return store.nextAutomaticGreetingAllowedAt(
             accountID: accountID, intervalSeconds: store.snapshot.automation.greetingIntervalSeconds
-        ).map { $0 <= now } ?? true
+        ).map { $0.timeIntervalSince(now) <= lead } ?? true
     }
 
     func searchIsDue(
@@ -3852,7 +3967,9 @@ final class BossAutomationController: ObservableObject {
         if usesCandidateSupply(store: store), !forceInitialSearch {
             return AutomationWorkerSchedulePolicy.detailBacklogIsDue(
                 lastAttemptAt: detailBacklogAttemptAtByAccount[accountID], now: Date(),
-                intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds
+                intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds(
+                    expedited: store.snapshot.automation.usesFastGreetingPacing
+                )
             )
         }
         let regularSearchIsDue = AutomationWorkerSchedulePolicy.jobSearchIsDue(
@@ -3872,9 +3989,12 @@ final class BossAutomationController: ObservableObject {
     }
 
     private func hasPersistedDetailBacklog(accountID: UUID, store: AppStore) -> Bool {
-        store.snapshot.jobs.contains { job in
+        let oldestBacklogDate = usesCandidateSupply(store: store)
+            ? Date().addingTimeInterval(-JobDetailBatchPolicy.candidateBacklogMaxAgeSeconds) : .distantPast
+        return store.snapshot.jobs.contains { job in
             job.accountID == accountID &&
                 job.stage == .discovered &&
+                job.capturedAt >= oldestBacklogDate &&
                 !job.hasCachedDetail &&
                 job.remoteJobID?.nilIfBlank != nil &&
                 job.securityID?.nilIfBlank != nil &&
@@ -3937,6 +4057,7 @@ final class BossAutomationController: ObservableObject {
     private func nextWorkerDelayNanoseconds(
         store: AppStore,
         sessions: BossSessionCoordinator,
+        accountID: UUID? = nil,
         now: Date = Date()
     ) -> UInt64 {
         if let cooldownUntil = store.snapshot.automation.safetyCooldownUntil, cooldownUntil > now {
@@ -3947,6 +4068,8 @@ final class BossAutomationController: ObservableObject {
         var candidateSeconds: [TimeInterval] = []
         var hasQueuedGreetingCandidate = false
         let activeAccounts = Self.workerScheduleEligibleAccounts(store.snapshot.accounts)
+            .filter { accountID == nil || $0.id == accountID }
+        let fast = store.snapshot.automation.usesFastGreetingPacing
         if store.snapshot.automation.automaticallyMonitorMessages {
             let messageCandidates = activeAccounts.compactMap { account -> TimeInterval? in
                 guard let session = sessions.existingSession(for: account.id) else { return nil }
@@ -3969,7 +4092,11 @@ final class BossAutomationController: ObservableObject {
                 if usesCandidateSupply(store: store) {
                     return AutomationWorkerSchedulePolicy.secondsUntilDetailBacklogDue(
                         lastAttemptAt: detailBacklogAttemptAtByAccount[account.id], now: now,
-                        intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds
+                        intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds(
+                            expedited: fast
+                        ),
+                        minimumSeconds: fast ? AutomationWorkerSchedulePolicy.responsiveWakeFloorSeconds
+                            : AutomationWorkerSchedulePolicy.retryFloorSeconds
                     )
                 }
                 return AutomationWorkerSchedulePolicy.secondsUntilDue(
@@ -4017,13 +4144,16 @@ final class BossAutomationController: ObservableObject {
                     accountID: account.id,
                     intervalSeconds: store.snapshot.automation.greetingIntervalSeconds
                 ) ?? now
-                let effectiveNextAllowedAt = max(nextAllowedAt, automaticWritesAllowedAfter ?? now)
+                let lead = fast ? AutomaticGreetingPacingPolicy.fastPreflightLeadSeconds : 0
+                let effectiveNextAllowedAt = max(
+                    nextAllowedAt.addingTimeInterval(-lead), automaticWritesAllowedAfter ?? now
+                )
                 hasQueuedGreetingCandidate = true
                 candidateSeconds.append(max(0, effectiveNextAllowedAt.timeIntervalSince(now)))
             }
         }
         // 至少每分钟重新检查调度，及时响应间隔调整、会话就绪和新增候选。
-        let minimumSeconds = hasQueuedGreetingCandidate
+        let minimumSeconds = hasQueuedGreetingCandidate || fast
             ? AutomationWorkerSchedulePolicy.responsiveWakeFloorSeconds
             : AutomationWorkerSchedulePolicy.retryFloorSeconds
         let seconds = AutomationWorkerSchedulePolicy.boundedSleepSeconds(

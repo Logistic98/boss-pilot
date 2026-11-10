@@ -582,6 +582,7 @@ final class BossResumeExchangeService {
         expectedSecurityID: String,
         expectedJobID: String,
         text: String,
+        notBefore: Date = .distantPast,
         commitIsStillAuthorized: @escaping @MainActor () -> Bool,
         markWriteStarted: @escaping @MainActor () throws -> Void
     ) async throws -> BossGreetingDeliveryReceipt {
@@ -629,6 +630,7 @@ final class BossResumeExchangeService {
             try await BossNetworkPacingGate.shared.wait(
                 isWrite: true,
                 discriminator: "greeting-websocket|\(profileID.uuidString)",
+                notBefore: notBefore,
                 isStillValid: { await !client.isInvalidated }
             )
             guard commitIsStillAuthorized() else {
@@ -1838,7 +1840,7 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
         var lastSelectedHasFriend = false
         for attempt in 0..<50 {
             try Task.checkCancellation()
-            if attempt == 1 {
+            if attempt == 1, !lastTargetLocated {
                 isPrepared = false
                 try await prepare()
             }
@@ -2147,6 +2149,9 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
         let result = try await evaluateAsyncDictionary(script)
         guard result["sent"] as? Bool == true else {
             switch result["reason"] as? String {
+            case "acknowledgementTimeout":
+                // 已提交发送，继续通过完整历史核对结果。
+                return
             case "conversationMismatch":
                 throw BossResumeExchangeError.greetingConversationMismatch
             case "webSocketUnavailable", "senderUnavailable", "syncUnavailable":

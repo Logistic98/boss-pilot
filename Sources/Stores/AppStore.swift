@@ -691,7 +691,7 @@ final class AppStore: ObservableObject {
                     )
             }
             if snapshot.automation.greetingIntervalSeconds <=
-                AutomationSettings.greetingIntervalSecondsRange.lowerBound {
+                AutomationSettings.defaultGreetingIntervalSeconds {
                 snapshot.automation.greetingIntervalSeconds =
                     AutomationSettings.defaultGreetingIntervalSeconds
             } else {
@@ -749,6 +749,9 @@ final class AppStore: ObservableObject {
             )
             snapshot.automation.searchIntervalMinutes = max(
                 snapshot.automation.searchIntervalMinutes, AutomationSettings.defaultSearchIntervalMinutes
+            )
+            snapshot.automation.greetingIntervalSeconds = max(
+                snapshot.automation.greetingIntervalSeconds, AutomationSettings.defaultGreetingIntervalSeconds
             )
             snapshot.automation.workerEnabled = false
             snapshot.schemaVersion = 25
@@ -1725,11 +1728,13 @@ final class AppStore: ObservableObject {
             let index = [localIndex, remoteIndex].compactMap { $0 }.min()
             if let index {
                 let previous = updated.jobs[index]
+                let reopened = previous.stage == .closed &&
+                    job.securityID?.appStoreNonempty != nil && job.securityID != previous.securityID
                 localIndices[previous.id]?.remove(index)
                 if let remoteID = previous.remoteJobID {
                     remoteIndices[previous.accountID]?[remoteID]?.remove(index)
                 }
-                if !job.hasCachedDetail, previous.hasCachedDetail {
+                if !reopened, !job.hasCachedDetail, previous.hasCachedDetail {
                     job.description = previous.description
                     job.detailFetchedAt = previous.detailFetchedAt
                     job.recruiterName = job.recruiterName ?? previous.recruiterName
@@ -1747,7 +1752,9 @@ final class AppStore: ObservableObject {
                     }
                     if selectedJobID == previous.id { selectedJobID = job.id }
                 }
-                if previous.evidenceText == job.evidenceText {
+                if reopened {
+                    job.assessment = nil
+                } else if previous.evidenceText == job.evidenceText {
                     job.assessment = previous.assessment
                     job.stage = previous.stage
                 } else {
@@ -1773,6 +1780,13 @@ final class AppStore: ObservableObject {
            selectedAccountID == nil || selectedAccountID == first.accountID {
             selectedJobID = first.id
         }
+        scheduleSave()
+    }
+
+    func markJobUnavailable(id: String, securityID: String) {
+        guard let index = snapshot.jobs.firstIndex(where: { $0.id == id && $0.securityID == securityID }),
+              [.discovered, .recommended, .rejected].contains(snapshot.jobs[index].stage) else { return }
+        snapshot.jobs[index].stage = .closed
         scheduleSave()
     }
 
@@ -1822,18 +1836,23 @@ final class AppStore: ObservableObject {
         let account = snapshot.accounts.first { $0.id == accountID }
         let evaluation = Task.detached(priority: .userInitiated) {
             let requiredTerms = Set(JobSearchPlanningPolicy.explicitRequiredTerms(in: preferences.requirementText))
+            let roleTerms = JobMatchingPolicy.targetRoleTerms(resume: resume, preferences: preferences)
+            let recentCutoff = Date().addingTimeInterval(-JobDetailBatchPolicy.candidateBacklogMaxAgeSeconds)
             var results: [(job: JobListing, assessment: JobAssessment)] = []
             let count = max(0, limit ?? Int.max)
             for job in jobs {
                 guard !Task.isCancelled, results.count < count else { break }
                 guard job.accountID == accountID, job.hasAuthoritativeDescription else { continue }
-                let staleRequiredTerm = job.stage == .rejected && job.assessment?.provider == "本地规则" &&
-                    job.assessment?.risks.contains(where: { risk in
+                let previousLocalRejection = job.stage == .rejected && job.assessment?.provider == "本地规则"
+                let staleRequiredTerm = previousLocalRejection && job.assessment?.risks.contains(where: { risk in
                         guard risk.hasPrefix("缺少必需关键词：") else { return false }
                         return risk.dropFirst("缺少必需关键词：".count).components(separatedBy: "、")
                             .contains { !requiredTerms.contains($0) }
                     }) == true
-                guard (job.stage == .discovered && job.assessment == nil) || staleRequiredTerm else { continue }
+                let staleRole = previousLocalRejection && job.capturedAt >= recentCutoff &&
+                    job.assessment?.risks.contains("岗位名称未命中目标方向") == true &&
+                    roleTerms.contains { JobMatchingPolicy.roleTerm($0, matchesTitle: job.title) }
+                guard (job.stage == .discovered && job.assessment == nil) || staleRequiredTerm || staleRole else { continue }
                 results.append((job, JobMatchingPolicy.assess(job: job, resume: resume, preferences: preferences)))
             }
             return results
@@ -2323,7 +2342,20 @@ final class AppStore: ObservableObject {
                     intervalSeconds: intervalSeconds
                 )
             }
+        let previousWrite = latestAutomaticGreetingWrite(accountID: accountID)
+        if previousWrite?.succeededAt == nil, let submittedAt = previousWrite?.deliveryWriteStartedAt {
+            let recoveryAt = submittedAt.addingTimeInterval(AutomaticGreetingPacingPolicy.unconfirmedWritePauseSeconds)
+            return max(perIdentityDate ?? .distantPast, recoveryAt)
+        }
         return perIdentityDate
+    }
+
+    func latestAutomaticGreetingWrite(accountID: UUID) -> AutomaticGreetingAttempt? {
+        guard let remoteIdentityID = snapshot.accounts.first(where: { $0.id == accountID })?
+            .remoteProfile?.remoteID.appStoreNonempty else { return nil }
+        return snapshot.automaticGreetingAttempts
+            .filter { $0.remoteIdentityID == remoteIdentityID && $0.deliveryWriteStartedAt != nil }
+            .max { ($0.deliveryWriteStartedAt ?? .distantPast) < ($1.deliveryWriteStartedAt ?? .distantPast) }
     }
 
     func hasQueuedAutomaticGreetingCandidate(accountID: UUID) -> Bool {

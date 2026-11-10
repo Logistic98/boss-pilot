@@ -131,7 +131,12 @@ struct AutomationSettingsTab: View {
             Label("自动检索已开启", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
             Text("待开聊不足 \(JobDetailBatchPolicy.candidateBufferSize) 个时按需补货，充足时暂停。")
-            Text("每批结束至少等待 \(Int(AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds)) 秒，消息处理与发送优先。")
+            let interval = AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds(
+                expedited: store.snapshot.automation.usesFastGreetingPacing
+            )
+            Text(store.snapshot.automation.usesFastGreetingPacing
+                 ? "两批开始时间至少间隔 \(Int(interval)) 秒，开聊核对优先。"
+                 : "每批结束至少等待 \(Int(interval)) 秒，消息处理与发送优先。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Toggle("同步后自动评估", isOn: boolBinding(\.automaticallyAssessJobs))
@@ -144,8 +149,14 @@ struct AutomationSettingsTab: View {
                 .foregroundStyle(.green)
             Stepper("每个账号每日最多 \(store.snapshot.automation.dailyGreetingLimit) 次",
                     value: intBinding(\.dailyGreetingLimit), in: AutomationSettings.dailyGreetingLimitRange, step: 5)
-            Stepper("开聊间隔：至少 \((Double(store.snapshot.automation.greetingIntervalSeconds) / 60).formatted(.number.precision(.fractionLength(0...1)))) 分钟",
-                    value: intBinding(\.greetingIntervalSeconds), in: AutomationSettings.greetingIntervalSecondsRange, step: 60)
+            Stepper("开聊间隔：至少 \(store.snapshot.automation.greetingIntervalSeconds) 秒",
+                    value: intBinding(\.greetingIntervalSeconds), in: AutomationSettings.greetingIntervalSecondsRange, step: 15)
+            Button(store.snapshot.automation.usesFastGreetingPacing ? "恢复默认节奏" : "使用快速开聊（30 秒）") {
+                store.updateAutomation {
+                    $0.greetingIntervalSeconds = $0.usesFastGreetingPacing
+                        ? AutomationSettings.defaultGreetingIntervalSeconds : AutomationSettings.fastGreetingIntervalSeconds
+                }
+            }
         }
     }
 

@@ -133,7 +133,8 @@ private struct BossSessionLifecycleAgent: View {
             let outcome = await bossAutomation.synchronizeProfile(
                 account: account,
                 session: session,
-                store: store
+                store: store,
+                reuseFreshProfile: store.snapshot.automation.usesFastGreetingPacing
             )
             if outcome == .performed {
                 profileSyncRetryCount = 0

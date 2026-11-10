@@ -759,6 +759,36 @@ struct SelfCheck {
         )
         passed.append("boss search pagination persistence and isolation")
 
+        var staggeredPagination = persistedPaginationSettings
+        staggeredPagination.recordCompletedJobSearchPage(
+            accountID: paginationAccountA, planFingerprint: paginationPlan,
+            completedPage: secondPage, nextTargetIndex: 1
+        )
+        staggeredPagination = try JSONDecoder().decode(
+            AutomationSettings.self, from: JSONEncoder().encode(staggeredPagination)
+        )
+        try verify(
+            staggeredPagination.nextJobSearchPage(accountID: paginationAccountA, planFingerprint: paginationPlan) == 2 &&
+            staggeredPagination.nextJobSearchTargetIndex(
+                accountID: paginationAccountA, planFingerprint: paginationPlan, targetCount: paginationTargets.count
+            ) == 1 &&
+            staggeredPagination.nextJobSearchTargetIndex(
+                accountID: paginationAccountB, planFingerprint: paginationPlan, targetCount: paginationTargets.count
+            ) == 0,
+            "快速补货没有保存当前页的检索目标进度"
+        )
+        staggeredPagination.recordCompletedJobSearchPage(
+            accountID: paginationAccountA, planFingerprint: paginationPlan, completedPage: secondPage
+        )
+        try verify(
+            staggeredPagination.nextJobSearchPage(accountID: paginationAccountA, planFingerprint: paginationPlan) == 3 &&
+            staggeredPagination.nextJobSearchTargetIndex(
+                accountID: paginationAccountA, planFingerprint: paginationPlan, targetCount: paginationTargets.count
+            ) == 0,
+            "完成最后一组检索条件后没有进入下一页"
+        )
+        passed.append("staggered candidate search target rotation")
+
         let contextualError = BossAPIError.upstream(
             operation: .accountExpectations,
             code: 19,
@@ -1442,6 +1472,15 @@ struct SelfCheck {
             "同一岗位方向仅因研发/开发措辞或标题修饰不同而被误拒"
         )
         passed.append("equivalent job role title matching")
+        let explicitRoleRequirements = "1、岗位：Agent研发工程师 / AI应用研发工程师 / 全栈研发工程师 / FDE工程师   我的能力是偏工程的。\n2、地域：优先上海"
+        try verify(
+            JobSearchPlanningPolicy.explicitRoleQueries(in: explicitRoleRequirements) ==
+                ["Agent研发工程师", "AI应用研发工程师", "全栈研发工程师", "FDE工程师"] &&
+            JobMatchingPolicy.roleTerm("Agent研发工程师", matchesTitle: "智能体后端开发工程师") &&
+            JobMatchingPolicy.roleTerm("FDE工程师", matchesTitle: "Forward Deployed Engineer") &&
+            !JobMatchingPolicy.roleTerm("AI应用研发工程师", matchesTitle: "AI应用产品经理"),
+            "明确岗位方向解析遗漏，或把无关岗位当成等价方向"
+        )
         var dailyInternship = JobListing(
             id: "job-daily-internship",
             accountID: accepted.accountID,
@@ -1727,6 +1766,28 @@ struct SelfCheck {
         )
         passed.append("automation bounds")
         let requestNow = Date(timeIntervalSince1970: 1_700_000_000)
+        var fastWorker = defaultWorker
+        fastWorker.greetingIntervalSeconds = AutomationSettings.fastGreetingIntervalSeconds
+        let savedFastWorker = try automationDecoder.decode(
+            AutomationSettings.self, from: JSONEncoder().encode(fastWorker)
+        )
+        let fastRecord = AutomaticGreetingSafetyRecord(
+            remoteIdentityID: "fast-identity", remoteJobID: "fast-job", attemptedAt: requestNow
+        )
+        let fastDue = AutomaticGreetingPacingPolicy.nextAllowedAt(
+            after: fastRecord, intervalSeconds: savedFastWorker.greetingIntervalSeconds
+        )
+        try verify(
+            !defaultWorker.usesFastGreetingPacing && savedFastWorker.usesFastGreetingPacing &&
+            savedFastWorker.dailyGreetingLimit == 150 &&
+            (30...35).contains(Int(fastDue.timeIntervalSince(requestNow))) &&
+            BossRequestPacingPolicy.nextAllowedAt(
+                lastDispatchedAt: requestNow, lastWriteAt: requestNow,
+                isWrite: true, readJitter: 1, writeJitter: 1, now: requestNow, expedited: true
+            ) == requestNow.addingTimeInterval(6),
+            "快速节奏未持久化、突破每日上限或全局写间隔"
+        )
+        passed.append("fast greeting pacing opt-in and shared write floor")
         try verify(
             BossRequestPacingPolicy.nextAllowedAt(
                 lastDispatchedAt: requestNow, lastWriteAt: requestNow.addingTimeInterval(-80),
@@ -1785,12 +1846,12 @@ struct SelfCheck {
         )
         let pacingAllowedAt = AutomaticGreetingPacingPolicy.nextAllowedAt(
             after: pacingRecord,
-            intervalSeconds: 30
+            intervalSeconds: AutomationSettings.defaultGreetingIntervalSeconds
         )
         try verify(
             AutomaticGreetingPacingPolicy.nextAllowedAt(
                 after: pacingRecord,
-                intervalSeconds: 30
+                intervalSeconds: AutomationSettings.defaultGreetingIntervalSeconds
             ) == pacingAllowedAt &&
             pacingAllowedAt.timeIntervalSince(pacingRecord.attemptedAt) >= 180 &&
             pacingAllowedAt.timeIntervalSince(pacingRecord.attemptedAt) <= 195 &&
@@ -1878,6 +1939,14 @@ struct SelfCheck {
         let priorityScores = try JobDetailBatchPolicy.priorityScores(jobs: [priorityJob], preferences: priorityPreferences)
         try verify(priorityScores["detail-priority-remote"] == JobMatchingPolicy.hardGateFailures(job: priorityJob, preferences: priorityPreferences).count,
                    "后台详情排序改变了匹配规则")
+        var unrelatedPriorityJob = priorityJob
+        unrelatedPriorityJob.title = "财务经理"
+        unrelatedPriorityJob.remoteJobID = "other-role"
+        let rolePriority = try JobDetailBatchPolicy.priorityScores(
+            jobs: [unrelatedPriorityJob, priorityJob], preferences: priorityPreferences, roleTerms: ["Java"]
+        )
+        try verify(rolePriority["detail-priority-remote"] == 2 && rolePriority["other-role"] == 3,
+                   "快速补货未优先读取命中岗位方向的候选")
         try verify(
             JobDetailBatchPolicy.canReadDetail(lastFailureAt: nil, now: requestNow) &&
             !JobDetailBatchPolicy.canReadDetail(lastFailureAt: requestNow, now: requestNow.addingTimeInterval(899)) &&
@@ -4105,6 +4174,17 @@ struct SelfCheck {
             )
         }
         passed.append("boss payload fixtures")
+        let mixedJobDetail = BossPayloadParser.jobDetail(from: [
+            "bossInfo": ["title": "招聘专员", "bossTitle": "招聘专员"],
+            "jobInfo": ["jobName": "Agent研发工程师", "postDescription": "负责智能体工程开发"]
+        ], securityID: "detail-security", listID: "detail-list")
+        let detailWithoutTitle = BossPayloadParser.jobDetail(from: [
+            "bossInfo": ["title": "HRBP", "bossTitle": "HRBP"],
+            "postDescription": "负责全栈研发"
+        ], securityID: "detail-security", listID: "detail-list")
+        try verify(mixedJobDetail?.title == "Agent研发工程师" && mixedJobDetail?.recruiterTitle == "招聘专员" &&
+                   detailWithoutTitle?.title.isEmpty == true && detailWithoutTitle?.description == "负责全栈研发",
+                   "招聘方职务覆盖了岗位名称，或缺少详情标题时未给列表标题保留回退")
 
         if let parsedJob {
             var rotatedJob = parsedJob
@@ -4605,6 +4685,19 @@ struct SelfCheck {
                 intervalSeconds: 30
             )?.timeIntervalSince(quotaNow) ?? 0) >= 30,
             "单账号抖动间隔、多账号独立开聊或动态总容量失效"
+        )
+        try pacingStore.markAutomaticGreetingWriteStarted(jobID: pacingJobB.id, at: quotaNow)
+        try verify(
+            pacingStore.latestAutomaticGreetingWrite(accountID: pacingAccountA.id) == nil &&
+            pacingStore.nextAutomaticGreetingAllowedAt(accountID: pacingAccountB.id, intervalSeconds: 30) ==
+                quotaNow.addingTimeInterval(90),
+            "未确认的开聊没有按账号暂停，或暂停串到其他账号"
+        )
+        pacingStore.recordAutomaticGreeting(jobID: pacingJobB.id, confirmedMessageID: "1234", deliveredAt: quotaNow)
+        try verify(
+            pacingStore.nextAutomaticGreetingAllowedAt(accountID: pacingAccountB.id, intervalSeconds: 30)
+                .map { $0 <= quotaNow.addingTimeInterval(35) } == true,
+            "权威回执已确认但开聊仍处于额外等待"
         )
 
         let fairnessURL = FileManager.default.temporaryDirectory
@@ -5880,6 +5973,10 @@ struct SelfCheck {
                 lastAttemptAt: now, now: now.addingTimeInterval(45),
                 intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds
             ) == 45 &&
+            AutomationWorkerSchedulePolicy.detailBacklogIsDue(
+                lastAttemptAt: now, now: now.addingTimeInterval(10),
+                intervalSeconds: AutomationWorkerSchedulePolicy.candidateReplenishmentIntervalSeconds(expedited: true)
+            ) &&
             JobDetailBatchPolicy.needsCandidates(queuedCount: 7, usedDailyQuota: 149, dailyLimit: 150) &&
             !JobDetailBatchPolicy.needsCandidates(queuedCount: 8, usedDailyQuota: 0, dailyLimit: 150) &&
             !JobDetailBatchPolicy.needsCandidates(queuedCount: 0, usedDailyQuota: 150, dailyLimit: 150),
@@ -5972,6 +6069,41 @@ struct SelfCheck {
         store.updateAutomation { $0.dailyGreetingLimit = 150 }
         try verify(controller.searchIsDue(accountID: account.id, store: store),
                    "恢复每日可用额度后未继续补货")
+
+        store.updateAutomation { $0.greetingIntervalSeconds = 30 }
+        let nextReservation = try required(
+            store.nextAutomaticGreetingAllowedAt(accountID: account.id, intervalSeconds: 30),
+            "缺少下一次开聊预约时间"
+        )
+        let beforeReservation = nextReservation.addingTimeInterval(-5)
+        try verify(controller.shouldYieldToGreeting(accountID: account.id, store: store, now: beforeReservation) &&
+                   !controller.shouldYieldToGreeting(accountID: account.id, store: store,
+                                                     now: nextReservation.addingTimeInterval(-9)),
+                   "快速档没有为只读额度核对预留时间，或过早中断补货")
+        do {
+            try store.prepareAutomaticGreeting(jobID: moreJobs[0].id, now: beforeReservation)
+            throw SelfCheckError.failed("提前核对额度后提前占用了开聊名额")
+        } catch BossAutomationError.operationNotReady {}
+
+        var unavailable = JobListing(id: "unavailable", accountID: account.id, title: "Java", company: "示例公司")
+        unavailable.remoteJobID = "unavailable-remote"
+        unavailable.securityID = "old-route"
+        unavailable.listID = "unavailable-list"
+        store.upsertJobs([unavailable])
+        store.markJobUnavailable(id: unavailable.id, securityID: "other-route")
+        try verify(store.snapshot.jobs.first(where: { $0.id == unavailable.id })?.stage == .discovered,
+                   "旧路由的失败关闭了当前岗位")
+        store.markJobUnavailable(id: unavailable.id, securityID: "old-route")
+        store.upsertJobs([unavailable])
+        try persistence.save(store.snapshot)
+        let reopenedStore = AppStore(persistence: persistence)
+        reopenedStore.load()
+        try verify(reopenedStore.snapshot.jobs.first(where: { $0.id == unavailable.id })?.stage == .closed,
+                   "明确下线的同一路由重复进入详情队列")
+        unavailable.securityID = "new-route"
+        reopenedStore.upsertJobs([unavailable])
+        try verify(reopenedStore.snapshot.jobs.first(where: { $0.id == unavailable.id })?.stage == .discovered,
+                   "重新检索到有效路由后仍无法补齐详情")
 
         try verify(BossServerFailurePolicy.requiresSafetyCooldown(.httpStatus(429)) &&
                    BossServerFailurePolicy.requiresSafetyCooldown(.httpStatus(403)) &&
@@ -6976,6 +7108,15 @@ struct SelfCheck {
                         TimeInterval(BossRequestPacingPolicy.maximumReadJitterSeconds) + 1,
                     "取消写操作后读请求被饿死或绕过限速"
                 )
+                let fastStartedAt = Date()
+                let sendNotBefore = fastStartedAt.addingTimeInterval(4)
+                try await BossNetworkPacingGate.$expedited.withValue(true) {
+                    try await gate.wait(isWrite: true, discriminator: "test-fast-greeting", notBefore: sendNotBefore)
+                }
+                let fastDelay = Date().timeIntervalSince(fastStartedAt)
+                try verify(fastDelay >= 4 &&
+                           fastDelay < BossRequestPacingPolicy.minimumReadIntervalSeconds,
+                           "快速开聊突破共享间隔或仍受常规读取间隔阻塞")
 
                 let clientProfile = UUID()
                 BossWebSessionService.beginRetiring(profileID: clientProfile)

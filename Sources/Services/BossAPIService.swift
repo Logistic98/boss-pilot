@@ -780,7 +780,7 @@ enum BossPayloadParser {
 
     static func jobDetail(from payload: Any, securityID: String, listID: String) -> BossRemoteJob? {
         guard let object = firstDictionary(in: payload) else { return nil }
-        var result = remoteJob(from: object, fallbackListID: listID) ?? BossRemoteJob(
+        var result = remoteJob(from: object, fallbackListID: listID, allowsGenericRootTitle: false) ?? BossRemoteJob(
             remoteJobID: "",
             securityID: securityID,
             listID: listID,
@@ -799,7 +799,6 @@ enum BossPayloadParser {
             "postDescription", "jobDescription", "description", "jobDesc",
             "detailText", "jobSecText", "jobContent", "positionDescription"
         ])
-        if result.title.isEmpty { result.title = deepString(payload, keys: ["jobName", "positionName", "title"]) }
         if result.company.isEmpty { result.company = deepString(payload, keys: ["brandName", "companyName", "company"]) }
         if result.salary.isEmpty { result.salary = deepString(payload, keys: ["salaryDesc", "salary", "jobSalary"]) }
         if result.location.isEmpty {
@@ -1027,8 +1026,18 @@ enum BossPayloadParser {
         return BossIndustryResolver.displayText(for: deepString(payload, keys: ["industry", "brandIndustry"]))
     }
 
-    private static func remoteJob(from row: [String: Any], fallbackListID: String) -> BossRemoteJob? {
-        let title = deepString(row, keys: ["jobName", "positionName", "title", "name"])
+    private static func remoteJob(
+        from row: [String: Any], fallbackListID: String, allowsGenericRootTitle: Bool = true
+    ) -> BossRemoteJob? {
+        let recruiterTitle = deepString(row, keys: ["bossTitle", "recruiterTitle", "bossPosition"])
+        let jobInfo = row["jobInfo"] as? [String: Any]
+        let explicitTitle = deepString(jobInfo ?? row, keys: ["jobName", "positionName"]).nilIfBlank
+            ?? deepString(row, keys: ["jobName", "positionName"]).nilIfBlank
+        // 通用 title/name 只在已知岗位节点读取，招聘方职务不能覆盖列表中的岗位名。
+        let titleFields = jobInfo ?? (allowsGenericRootTitle ? row : [:])
+        let genericTitle = ["title", "name"].compactMap { (titleFields[$0] as? String)?.nilIfBlank }
+            .first { $0.caseInsensitiveCompare(recruiterTitle) != .orderedSame }
+        let title = explicitTitle ?? genericTitle ?? ""
         let company = deepString(row, keys: ["brandName", "companyName", "company", "brand"])
         guard !title.isEmpty || !company.isEmpty else { return nil }
         let securityID = deepString(row, keys: ["securityId", "security_id"])
@@ -1075,7 +1084,7 @@ enum BossPayloadParser {
             description: deepString(row, keys: ["postDescription", "jobDescription", "jobDesc", "jobSecText", "jobContent"]),
             recruiterName: deepString(row, keys: ["bossName", "boss", "recruiterName"]),
             url: officialURL,
-            recruiterTitle: deepString(row, keys: ["bossTitle", "recruiterTitle", "bossPosition"]),
+            recruiterTitle: recruiterTitle,
             industry: industryText(from: row),
             companySize: deepString(row, keys: ["scaleName", "brandScaleName", "companySize", "companyScale"]),
             financingStage: deepString(row, keys: ["stageName", "brandStageName", "financingStage", "financeStage"]),
