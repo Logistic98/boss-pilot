@@ -154,12 +154,6 @@ final class BossAutomationController: ObservableObject {
     func startWorker(using store: AppStore, sessions: BossSessionCoordinator, codex: CodexController, persist: Bool = true) -> Bool {
         codexController = codex
         guard !terminationRequested else { return false }
-        if let cooldownUntil = store.snapshot.automation.safetyCooldownUntil, cooldownUntil > Date() {
-            for account in Self.workerConfiguredAccounts(store.snapshot.accounts) {
-                statusByAccount[account.id] = "安全冷却中，请在 \(cooldownUntil.formatted(date: .abbreviated, time: .shortened)) 后检查账号并手动启动"
-            }
-            return false
-        }
         guard store.snapshot.automation.mode == .automatic else {
             store.report(BossAutomationError.automaticModeRequired)
             return false
@@ -441,16 +435,6 @@ final class BossAutomationController: ObservableObject {
             }
             return .ineligible
         }
-        if let cooldownUntil = store.snapshot.automation.safetyCooldownUntil,
-           cooldownUntil > Date() {
-            let status = "风控安全冷却中，最早于 \(cooldownUntil.formatted(date: .abbreviated, time: .shortened)) 恢复"
-            for account in configuredAccounts {
-                statusByAccount[account.id] = status
-            }
-            return .performed
-        } else if store.snapshot.automation.safetyCooldownUntil != nil {
-            store.updateAutomation { $0.safetyCooldownUntil = nil }
-        }
         let activeAccounts = Self.workerScheduleEligibleAccounts(configuredAccounts)
         guard !activeAccounts.isEmpty else {
             for account in configuredAccounts where account.manualVerificationChallenge != nil {
@@ -649,7 +633,9 @@ final class BossAutomationController: ObservableObject {
         if store.snapshot.automation.allowsExternalActions,
            store.snapshot.automation.automaticallySendGreetings {
             let greetingOutcome = await BossNetworkPacingGate.$expedited.withValue(expediteGreetings) {
-                await sendNextQualifiedGreeting(account: account, session: session, store: store)
+                await BossNetworkPacingGate.$prioritizesGreeting.withValue(expediteGreetings) {
+                    await sendNextQualifiedGreeting(account: account, session: session, store: store)
+                }
             }
             if greetingOutcome == .busy {
                 result.encounteredBusy = true
@@ -709,7 +695,9 @@ final class BossAutomationController: ObservableObject {
            store.snapshot.automation.automaticallySendGreetings,
            !Task.isCancelled {
             let greetingOutcome = await BossNetworkPacingGate.$expedited.withValue(expediteGreetings) {
-                await sendNextQualifiedGreeting(account: account, session: session, store: store)
+                await BossNetworkPacingGate.$prioritizesGreeting.withValue(expediteGreetings) {
+                    await sendNextQualifiedGreeting(account: account, session: session, store: store)
+                }
             }
             if greetingOutcome == .busy {
                 result.encounteredBusy = true
@@ -732,9 +720,11 @@ final class BossAutomationController: ObservableObject {
             automaticResumeWritePermitAccountIDs.insert(account.id)
         }
         defer { automaticResumeWritePermitAccountIDs.remove(account.id) }
-        let busy = await synchronizeMessages(
-            account: account, session: session, store: store, allowExternalActions: true
-        ) == .busy
+        let busy = await BossNetworkPacingGate.$expedited.withValue(store.snapshot.automation.usesFastGreetingPacing) {
+            await synchronizeMessages(
+                account: account, session: session, store: store, allowExternalActions: true
+            ) == .busy
+        }
         if busy { statusByAccount[account.id] = "等待该账号的当前任务完成" }
         return busy
     }
@@ -1017,7 +1007,7 @@ final class BossAutomationController: ObservableObject {
                     if case .manualVerificationRequired = error {
                         throw error
                     }
-                    if Self.safetyCooldownSeconds(for: error) != nil { throw error }
+                    if Self.requiresAccountPause(for: error) { throw error }
                     let jobID = remoteJobs[index].listing(accountID: account.id).id
                     if case .upstream(.jobDetail, 200301, _) = error {
                         store.markJobUnavailable(id: jobID, securityID: remoteJobs[index].securityID)
@@ -1031,7 +1021,7 @@ final class BossAutomationController: ObservableObject {
                         detail: "\(remoteJobs[index].title)：\(error.localizedDescription)"
                     )
                 } catch {
-                    if Self.safetyCooldownSeconds(for: error) != nil { throw error }
+                    if Self.requiresAccountPause(for: error) { throw error }
                     detailReadFailedAt[remoteJobs[index].listing(accountID: account.id).id] = Date()
                     store.addActivity(
                         accountID: account.id,
@@ -1100,7 +1090,7 @@ final class BossAutomationController: ObservableObject {
                     throw BossAPIError.authenticationRequired
                 } catch let error as BossAPIError {
                     if case .manualVerificationRequired = error { throw error }
-                    if Self.safetyCooldownSeconds(for: error) != nil { throw error }
+                    if Self.requiresAccountPause(for: error) { throw error }
                     if case .upstream(.jobDetail, 200301, _) = error {
                         store.markJobUnavailable(id: persistedJob.id, securityID: securityID)
                     } else {
@@ -1113,7 +1103,7 @@ final class BossAutomationController: ObservableObject {
                         detail: "\(persistedJob.title)：\(error.localizedDescription)"
                     )
                 } catch {
-                    if Self.safetyCooldownSeconds(for: error) != nil { throw error }
+                    if Self.requiresAccountPause(for: error) { throw error }
                     detailReadFailedAt[persistedJob.id] = Date()
                     store.addActivity(
                         accountID: account.id,
@@ -1267,6 +1257,8 @@ final class BossAutomationController: ObservableObject {
                 throw BossAutomationError.incompleteWebCredential
             }
             for resumeExchanges in [false, true] {
+                if resumeExchanges, allowExternalActions,
+                   !store.snapshot.automation.automaticallySendResume { continue }
                 let lastSyncedAt = resumeExchanges
                     ? store.dailyResumeExchangeLastSyncedAt(accountID: account.id)
                     : store.dailyCommunicationLastSyncedAt(accountID: account.id)
@@ -1286,7 +1278,7 @@ final class BossAutomationController: ObservableObject {
                     case BossAPIError.invalidPayload: break
                     case BossAPIError.authenticationRequired, BossAPIError.webTokenExpired: throw error
                     default:
-                        if Self.safetyCooldownSeconds(for: error) != nil { throw error }
+                        if Self.requiresAccountPause(for: error) { throw error }
                     }
                     store.addActivity(accountID: account.id, level: .warning,
                                       title: resumeExchanges ? "今日交换统计待核对" : "今日沟通统计待核对",
@@ -1339,7 +1331,7 @@ final class BossAutomationController: ObservableObject {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch let error as BossResumeExchangeError {
-                    if Self.safetyCooldownSeconds(for: error) != nil { throw error }
+                    if Self.requiresAccountPause(for: error) { throw error }
                     if case .unauthenticated = error { throw error }
                     if case .APIError(_, let code, _) = error,
                        code == 37 || BossServerFailurePolicy.requiresManualVerification(code) {
@@ -1365,7 +1357,7 @@ final class BossAutomationController: ObservableObject {
             })?.remoteProfile?.remoteID.nilIfBlank else { return .unavailable }
             let validRoutes = historyRoutes(accountID: account.id, store: store)
             let routes = historyRoutesForSynchronization(accountID: account.id, store: store,
-                limit: allowExternalActions ? 3 : 20)
+                limit: allowExternalActions ? (BossNetworkPacingGate.expedited ? 2 : 3) : 20)
             let accountConversationCount = store.snapshot.conversations.filter {
                 $0.accountID == account.id
             }.count
@@ -1595,7 +1587,7 @@ final class BossAutomationController: ObservableObject {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch let error as BossResumeExchangeError {
-                    if Self.safetyCooldownSeconds(for: error) != nil { throw error }
+                    if Self.requiresAccountPause(for: error) { throw error }
                     if case .unauthenticated = error { throw error }
                     if case .APIError(_, let code, _) = error,
                        code == 37 || BossServerFailurePolicy.requiresManualVerification(code) {
@@ -2662,9 +2654,9 @@ final class BossAutomationController: ObservableObject {
                 return .authenticationExpired(status: status)
             }
             guard operationRemainsCurrent else { return .cancelled }
-            if let cooldownSeconds = Self.safetyCooldownSeconds(for: error) {
-                applySafetyCooldown(seconds: cooldownSeconds, reason: error.localizedDescription, store: store)
-                return .requiresAttention(status: "BOSS 附件接口已触发风控冷却；不确定的发送不会重试")
+            if Self.requiresAccountPause(for: error) {
+                pauseAccountForRisk(account: account, reason: error.localizedDescription, store: store)
+                return .requiresAttention(status: "该账号附件任务已暂停；不确定的发送不会重试")
             }
             if stage.isAttachmentWrite {
                 recoverAttachmentPreparationRecord(recordID: recordID, store: store)
@@ -2853,7 +2845,7 @@ final class BossAutomationController: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch let error as BossResumeExchangeError {
-                if Self.safetyCooldownSeconds(for: error) != nil { throw error }
+                if Self.requiresAccountPause(for: error) { throw error }
                 if case .unauthenticated = error { throw error }
                 if case .APIError(_, let code, _) = error,
                    code == 37 || BossServerFailurePolicy.requiresManualVerification(code) {
@@ -2957,8 +2949,8 @@ final class BossAutomationController: ObservableObject {
             session: session,
             identityRevision: identityRevision
         ) else { return }
-        if let cooldownSeconds = Self.safetyCooldownSeconds(for: error) {
-            applySafetyCooldown(seconds: cooldownSeconds, reason: error.localizedDescription, store: store)
+        if Self.requiresAccountPause(for: error) {
+            pauseAccountForRisk(account: account, reason: error.localizedDescription, store: store)
             return
         }
         switch error {
@@ -3343,6 +3335,7 @@ final class BossAutomationController: ObservableObject {
             }
             try store.prepareAutomaticGreeting(jobID: job.id)
             statusByAccount[account.id] = "正在对 \(job.title) 发起开聊"
+            let greetingAPIStartedAt = Date()
             let result = try await api.greet(
                 accountID: account.id,
                 profileID: account.webProfileID,
@@ -3352,6 +3345,9 @@ final class BossAutomationController: ObservableObject {
                 jobID: remoteJobID,
                 listID: listID
             )
+            fputs(String(format: "GREETING API: profile=%@ seconds=%.2f fast=%d\n",
+                         String(account.webProfileID.uuidString.suffix(4)), Date().timeIntervalSince(greetingAPIStartedAt),
+                         BossNetworkPacingGate.expedited ? 1 : 0), stderr)
             guard operationIsCurrent(
                 accountID: account.id,
                 generation: operationGeneration,
@@ -3496,6 +3492,10 @@ final class BossAutomationController: ObservableObject {
         statusByAccount[account.id] = error.localizedDescription
         let apiError = error as? BossAPIError
         let automationError = error as? BossAutomationError
+        let authenticationFailed: Bool = switch error {
+        case BossAPIError.authenticationRequired, BossResumeExchangeError.unauthenticated: true
+        default: false
+        }
         if case .manualVerificationRequired(let operation, let code, let message)? = apiError {
             stopAccountForManualVerification(
                 account: account,
@@ -3505,7 +3505,7 @@ final class BossAutomationController: ObservableObject {
                 store: store
             )
             return
-        } else if case .authenticationRequired? = apiError {
+        } else if authenticationFailed {
             let localSessionCleared = await session.markServerSessionExpired()
             store.synchronizeBossLoginStatus(accountID: account.id, loggedIn: false)
             statusByAccount[account.id] = localSessionCleared
@@ -3526,15 +3526,15 @@ final class BossAutomationController: ObservableObject {
             statusByAccount[account.id] = "接口会话正在自动准备"
             return
         }
-        if let cooldownSeconds = Self.safetyCooldownSeconds(for: error) {
-            applySafetyCooldown(
-                seconds: cooldownSeconds,
+        if Self.requiresAccountPause(for: error) {
+            pauseAccountForRisk(
+                account: account,
                 reason: error.localizedDescription,
                 store: store
             )
         }
         let title: String
-        if case .authenticationRequired? = apiError {
+        if authenticationFailed {
             title = "BOSS 登录态已失效"
         } else {
             title = "BOSS 本次任务失败"
@@ -3550,49 +3550,44 @@ final class BossAutomationController: ObservableObject {
         }
     }
 
-    static func safetyCooldownSeconds(for error: Error) -> TimeInterval? {
+    static func requiresAccountPause(for error: Error) -> Bool {
         if let exchangeError = error as? BossResumeExchangeError {
             switch exchangeError {
             case .httpStatus(_, 429, _), .httpStatus(_, 403, _), .APIError(_, 9, _):
-                return 24 * 60 * 60
+                return true
             case .APIError(_, let code, _) where BossServerFailurePolicy.requiresManualVerification(code):
-                return 24 * 60 * 60
+                return true
             default:
                 break
             }
         }
         if let apiError = error as? BossAPIError,
-           BossServerFailurePolicy.requiresSafetyCooldown(apiError) {
-            return 24 * 60 * 60
+           BossServerFailurePolicy.requiresAccountPause(apiError) {
+            return true
         }
-        return nil
+        return false
     }
 
-    private func applySafetyCooldown(
-        seconds: TimeInterval,
+    private func pauseAccountForRisk(
+        account: BossAccount,
         reason: String,
         store: AppStore
     ) {
-        let proposedUntil = Date().addingTimeInterval(seconds)
-        let currentUntil = store.snapshot.automation.safetyCooldownUntil
-        let cooldownUntil = max(currentUntil ?? proposedUntil, proposedUntil)
-        store.updateAutomation { $0.safetyCooldownUntil = cooldownUntil }
-        stopWorker(using: store)
+        guard store.snapshot.accounts.contains(where: { $0.id == account.id && $0.status == .active }) else { return }
+        // 先封存本账号可能已提交的写入，再暂停和取消，保留其他账号的进行中操作。
+        conservativelyFinalizeInterruptedResumeDeliveries(using: store, accountID: account.id)
+        store.setAccountAutomationPaused(accountID: account.id, paused: true)
+        invalidateOperations(accountID: account.id)
+        automaticResumeWritePermitAccountIDs.remove(account.id)
+        if Self.workerConfiguredAccounts(store.snapshot.accounts).isEmpty { stopWorker(using: store) }
+        statusByAccount[account.id] = "自动任务已暂停，请检查 BOSS 提示后手动恢复此账号"
+        store.addActivity(
+            accountID: account.id,
+            level: .warning,
+            title: "BOSS 账号自动任务已暂停",
+            detail: "已暂停此账号并取消其排队请求，其他账号不受影响。请在 BOSS 官方页面检查后手动恢复，不会自动重试。原因：\(reason)"
+        )
         store.flush()
-        for account in Self.workerConfiguredAccounts(store.snapshot.accounts) {
-            statusByAccount[account.id] = "检测到访问风险，后台已停止；\(cooldownUntil.formatted(date: .abbreviated, time: .shortened)) 后需手动检查并启动"
-        }
-        let duplicate = store.snapshot.activity.prefix(20).contains { entry in
-            entry.title == "BOSS 访问已进入安全冷却" &&
-                Date().timeIntervalSince(entry.createdAt) < 60
-        }
-        if !duplicate {
-            store.addActivity(
-                level: .warning,
-                title: "BOSS 访问已进入安全冷却",
-                detail: "BOSS 明确返回限流、拒绝访问或安全验证，已停止全部后台任务并取消排队请求。所有账号在 \(cooldownUntil.formatted(date: .abbreviated, time: .shortened)) 前不会继续请求；到期后需在官方页面确认账号正常，再手动启动。原因：\(reason)"
-            )
-        }
     }
 
     func invalidateOperations(accountID: UUID) {
@@ -3611,8 +3606,7 @@ final class BossAutomationController: ObservableObject {
         accountID: UUID,
         store: AppStore
     ) -> Bool {
-        store.snapshot.automation.safetyCooldownUntil.map { $0 > Date() } != true &&
-            store.snapshot.accounts.contains { $0.id == accountID && $0.status == .active }
+        store.snapshot.accounts.contains { $0.id == accountID && $0.status == .active }
     }
 
     private func stopAccountForManualVerification(
@@ -3622,8 +3616,8 @@ final class BossAutomationController: ObservableObject {
         message: String,
         store: AppStore
     ) {
-        applySafetyCooldown(seconds: 24 * 60 * 60, reason: message, store: store)
-        statusByAccount[account.id] = "BOSS 要求本人安全验证（\(code)），后台已停止，请在官方页面检查"
+        pauseAccountForRisk(account: account, reason: message, store: store)
+        statusByAccount[account.id] = "BOSS 要求本人安全验证（\(code)），此账号已暂停，请在官方页面检查"
         let duplicate = store.snapshot.activity.prefix(20).contains { entry in
             entry.accountID == account.id &&
                 entry.title == "BOSS 要求本人安全验证" &&
@@ -3634,7 +3628,7 @@ final class BossAutomationController: ObservableObject {
                 accountID: account.id,
                 level: .warning,
                 title: "BOSS 要求本人安全验证",
-                detail: "\(operation)返回业务码 \(code)：\(message)。已进入 24 小时安全冷却，不会自动重试；请在 BOSS 官方页面完成验证并确认账号状态。"
+                detail: "\(operation)返回业务码 \(code)：\(message)。此账号已暂停，不会自动重试；请在 BOSS 官方页面完成验证后手动恢复。"
             )
         }
     }
@@ -3738,10 +3732,11 @@ final class BossAutomationController: ObservableObject {
         }
     }
 
-    private func conservativelyFinalizeInterruptedResumeDeliveries(using store: AppStore) {
+    private func conservativelyFinalizeInterruptedResumeDeliveries(using store: AppStore, accountID: UUID? = nil) {
         let activeIdentityByAccountID = store.snapshot.accounts.reduce(into: [UUID: String]()) {
             result, account in
-            guard account.status == .active,
+            guard accountID == nil || account.id == accountID,
+                  account.status == .active,
                   let remoteIdentityID = account.remoteProfile?.remoteID.nilIfBlank else {
                 return
             }
@@ -3840,7 +3835,7 @@ final class BossAutomationController: ObservableObject {
     }
 
     private func searchQueries(store: AppStore) -> [String] {
-        let explicit = JobSearchPlanningPolicy.explicitRoleQueries(in: store.snapshot.preferences.requirementText)
+        let explicit = JobSearchPlanningPolicy.explicitRoleSearchQueries(in: store.snapshot.preferences.requirementText)
         if !explicit.isEmpty { return explicit }
         let fallback = JobSearchPlanningPolicy.fallbackSearchPlan(
             resume: store.snapshot.resume,
@@ -4060,11 +4055,6 @@ final class BossAutomationController: ObservableObject {
         accountID: UUID? = nil,
         now: Date = Date()
     ) -> UInt64 {
-        if let cooldownUntil = store.snapshot.automation.safetyCooldownUntil, cooldownUntil > now {
-            return UInt64(AutomationWorkerSchedulePolicy.boundedSleepSeconds(
-                [cooldownUntil.timeIntervalSince(now)]
-            ) * 1_000_000_000)
-        }
         var candidateSeconds: [TimeInterval] = []
         var hasQueuedGreetingCandidate = false
         let activeAccounts = Self.workerScheduleEligibleAccounts(store.snapshot.accounts)

@@ -700,6 +700,18 @@ struct SelfCheck {
             accountID: paginationAccountA,
             planFingerprint: paginationPlan
         )
+        let nextDayPlan = BossJobSearchPaginationPolicy.planFingerprint(
+            remoteIdentityID: "pagination-identity-a", resumeID: paginationResumeID,
+            requirementText: "上海优先，必须有 Agent 经验", targets: paginationTargets,
+            now: try required(Calendar.current.date(byAdding: .day, value: 1, to: Date()), "无法生成次日日期")
+        )
+        try verify(nextDayPlan != paginationPlan &&
+                   persistedPaginationSettings.nextJobSearchPage(
+                    accountID: paginationAccountA, planFingerprint: nextDayPlan
+                   ) == 1 && persistedPaginationSettings.nextJobSearchTargetIndex(
+                    accountID: paginationAccountA, planFingerprint: nextDayPlan, targetCount: 16
+                   ) == 0,
+                   "新一天仍从昨天的旧页继续检索，或跳过优先方向和城市")
         let repeatedReadWithoutCompletion = persistedPaginationSettings.nextJobSearchPage(
             accountID: paginationAccountA,
             planFingerprint: paginationPlan
@@ -845,31 +857,31 @@ struct SelfCheck {
             manualVerificationErrorsAreClassified &&
             ordinaryFrequencyClassified &&
             directHTTP429Classified &&
-            BossAutomationController.safetyCooldownSeconds(for: ordinaryFrequencyError) == 24 * 60 * 60 &&
-            BossAutomationController.safetyCooldownSeconds(for: directHTTP429) == 24 * 60 * 60 &&
-            BossAutomationController.safetyCooldownSeconds(for: BossResumeExchangeError.httpStatus(
+            BossAutomationController.requiresAccountPause(for: ordinaryFrequencyError) == true &&
+            BossAutomationController.requiresAccountPause(for: directHTTP429) == true &&
+            BossAutomationController.requiresAccountPause(for: BossResumeExchangeError.httpStatus(
                 endpoint: "/history", status: 429, writeMayHaveCommitted: false
-            )) == 24 * 60 * 60 &&
-            BossAutomationController.safetyCooldownSeconds(for: BossResumeExchangeError.httpStatus(
+            )) == true &&
+            BossAutomationController.requiresAccountPause(for: BossResumeExchangeError.httpStatus(
                 endpoint: "/resume", status: 403, writeMayHaveCommitted: true
-            )) == 24 * 60 * 60 &&
-            BossAutomationController.safetyCooldownSeconds(for: BossResumeExchangeError.APIError(
+            )) == true &&
+            BossAutomationController.requiresAccountPause(for: BossResumeExchangeError.APIError(
                 endpoint: "/resume", code: 9, writeMayHaveCommitted: true
-            )) == 24 * 60 * 60 &&
-            BossAutomationController.safetyCooldownSeconds(for: BossResumeExchangeError.APIError(
+            )) == true &&
+            BossAutomationController.requiresAccountPause(for: BossResumeExchangeError.APIError(
                 endpoint: "/resume", code: 1, writeMayHaveCommitted: false
-            )) == nil &&
-            BossAutomationController.safetyCooldownSeconds(for: BossAPIError.upstream(
+            )) == false &&
+            BossAutomationController.requiresAccountPause(for: BossAPIError.upstream(
                 operation: .greet, code: 1, message: "开聊提醒"
-            )) == nil &&
-            BossAutomationController.safetyCooldownSeconds(for: BossAPIError.upstream(
+            )) == true &&
+            BossAutomationController.requiresAccountPause(for: BossAPIError.upstream(
                 operation: .greet, code: 1, message: "请求频繁"
-            )) == 24 * 60 * 60 &&
-            BossAutomationController.safetyCooldownSeconds(for: staleConnectorSession) == nil &&
+            )) == true &&
+            BossAutomationController.requiresAccountPause(for: staleConnectorSession) == false &&
             staleConnectorSessionRefreshes,
-            "BOSS 人工验证错误分类、频率错误冷却或 1011 网页会话刷新策略不正确"
+            "BOSS 人工验证错误分类、频率错误账号暂停或 1011 网页会话刷新策略不正确"
         )
-        passed.append("boss manual verification and risk backoff policy")
+        passed.append("boss manual verification and account pause policy")
 
         let requestScopedFailures: [Error] = [
             BossAPIError.invalidPayload(BossWebAPIError.pageLoadTimedOut.localizedDescription),
@@ -880,6 +892,8 @@ struct SelfCheck {
             BossAPIError.httpStatus(408),
             BossAPIError.upstream(operation: .searchJobs, code: 1, message: "服务异常，请稍后再试"),
             BossAPIError.upstream(operation: .greet, code: 1, message: "Too many attachments"),
+            BossAPIError.upstream(operation: .greet, code: 1, message: "职位已关闭"),
+            BossAPIError.upstream(operation: .searchJobs, code: 1, message: "开聊提醒"),
             BossWebAPIError.pageLoadTimedOut,
             BossWebAPIError.requestInProgress,
             BossResumeExchangeError.navigationTimedOut,
@@ -889,8 +903,8 @@ struct SelfCheck {
             NSError(domain: "SelfCheck", code: 1, userInfo: [NSLocalizedDescriptionKey: "请稍后再试"])
         ]
         try verify(
-            requestScopedFailures.allSatisfy { BossAutomationController.safetyCooldownSeconds(for: $0) == nil },
-            "普通超时、数据异常、服务故障或稍后再试被误判为全局风控冷却"
+            requestScopedFailures.allSatisfy { BossAutomationController.requiresAccountPause(for: $0) == false },
+            "普通超时、数据异常、服务故障或稍后再试被误判为账号风控暂停"
         )
         let explicitRiskFailures: [Error] = [
             BossAPIError.httpStatus(403),
@@ -899,13 +913,15 @@ struct SelfCheck {
             BossAPIError.upstream(operation: .greet, code: 1, message: "账号已封禁"),
             BossAPIError.upstream(operation: .searchJobs, code: 1, message: "请求已限流"),
             BossAPIError.upstream(operation: .searchJobs, code: 1, message: "Too Many Requests"),
-            BossAPIError.upstream(operation: .searchJobs, code: 1, message: "Rate limit exceeded")
+            BossAPIError.upstream(operation: .searchJobs, code: 1, message: "Rate limit exceeded"),
+            BossAPIError.upstream(operation: .greet, code: 1, message: "开聊提醒"),
+            BossAPIError.upstream(operation: .greet, code: 1, message: "检测到操作异常，请完成安全验证")
         ]
         try verify(
-            explicitRiskFailures.allSatisfy { BossAutomationController.safetyCooldownSeconds(for: $0) == 24 * 60 * 60 },
-            "明确限流或拒绝访问未保留安全冷却"
+            explicitRiskFailures.allSatisfy { BossAutomationController.requiresAccountPause(for: $0) == true },
+            "明确限流或拒绝访问未保留账号暂停"
         )
-        passed.append("ordinary failures do not trigger global risk cooldown")
+        passed.append("ordinary failures do not pause accounts")
 
         let officialVerificationURL = URL(
             string: "https://www.zhipin.com/web/passport/zp/verify.html?callbackUrl=%2Fweb%2Fgeek%2Frecommend&code=36"
@@ -935,44 +951,120 @@ struct SelfCheck {
         let riskStopURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("BossPilot-RiskStop-\(UUID().uuidString)/state.json")
         defer { try? FileManager.default.removeItem(at: riskStopURL.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(at: riskStopURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let riskResumeURL = riskStopURL.deletingLastPathComponent().appendingPathComponent("resume.txt")
+        try Data("Java 后端开发".utf8).write(to: riskResumeURL)
         let riskStopPersistence = JSONStatePersistence(fileURL: riskStopURL)
+        var riskState = AppSnapshot()
+        riskState.resume.attachmentPath = riskResumeURL.path
+        riskState.preferences.requirementText = "上海，Java 后端开发岗位"
+        var riskStopAccount = BossAccount(displayName: "风险账号")
+        var riskPeerAccount = BossAccount(displayName: "正常账号")
+        var riskProfile = BossAccountProfile()
+        riskProfile.remoteID = "risk-identity-a"
+        riskStopAccount.remoteProfile = riskProfile
+        riskProfile.remoteID = "risk-identity-b"
+        riskPeerAccount.remoteProfile = riskProfile
+        riskState.accounts = [riskStopAccount, riskPeerAccount]
+        riskState.automation.mode = .automatic
+        riskState.automation.workerEnabled = true
+        riskState.automation.automaticallyMonitorMessages = true
+        riskState.jobs = [JobListing(id: "boss-risk-job", accountID: riskStopAccount.id,
+                                    title: "风险暂停测试岗位", company: "测试公司")]
+        riskState.automaticGreetingAttempts = [AutomaticGreetingAttempt(
+            accountID: riskStopAccount.id, remoteIdentityID: "risk-identity-a", remoteJobID: "risk-job"
+        )]
+        for (index, account) in riskState.accounts.enumerated() {
+            let evidence = ResumeConsentEvidence(
+                accountID: account.id, remoteIdentityID: account.remoteProfile!.remoteID,
+                conversationID: "risk-conversation-\(index)", triggerRemoteMID: "501\(index)",
+                triggerTextDigest: String(repeating: "a", count: 64), receivedAt: Date(),
+                exchangeKind: .acceptNativeRequest, nativeActionAID: 38, nativeScene: 1,
+                nativeDialogType: 2, nativeDialogWasOperated: false
+            )
+            var record = ResumeDeliveryRecord(evidence: evidence, attachmentSHA256: String(repeating: "b", count: 64))
+            record.state = .dispatching
+            record.writeStartedAt = Date()
+            record.writeBaselineRemoteMID = "100"
+            riskState.resumeDeliveryRecords.append(record)
+        }
+        try riskStopPersistence.save(riskState)
         let riskStopStore = AppStore(persistence: riskStopPersistence)
-        let riskStopAccountID = riskStopStore.addBossAccount()
-        let riskStopAccount = try required(riskStopStore.snapshot.accounts.first, "缺少风险停机测试账号")
-        riskStopStore.updateAutomation { $0.mode = .automatic; $0.workerEnabled = true }
-        let riskStopController = BossAutomationController(api: BossAPIService(allowsWebFallback: false))
+        riskStopStore.load()
+        let riskBefore = riskStopStore.snapshot
+        try verify(riskBefore.automation.workerEnabled, "风险暂停测试未开启后台运行意图")
+        let riskAPI = BossAPIService(allowsWebFallback: false)
+        let riskToken = riskAPI.requestToken(accountID: riskStopAccount.id)
+        let peerToken = riskAPI.requestToken(accountID: riskPeerAccount.id)
+        let riskStopController = BossAutomationController(api: riskAPI)
         riskStopController.registerManualVerificationPage(account: riskStopAccount, url: ordinaryBossURL, store: riskStopStore)
-        try verify(riskStopStore.snapshot.automation.workerEnabled, "普通页面误触发风险停机")
-        let riskDetectedAt = Date()
+        try verify(riskStopStore.snapshot.accounts.allSatisfy { $0.status == .active },
+                   "普通页面误触发账号暂停")
         riskStopController.registerManualVerificationPage(account: riskStopAccount, url: officialVerificationURL, store: riskStopStore)
         let riskStoppedSnapshot = try riskStopPersistence.load()
-        let riskCooldownUntil = try required(riskStoppedSnapshot.automation.safetyCooldownUntil, "风险停机未持久化冷却")
-        try verify(
-            !riskStopController.isWorkerRunning && !riskStoppedSnapshot.automation.workerEnabled &&
-            riskStoppedSnapshot.accounts.first?.id == riskStopAccountID &&
-            riskCooldownUntil.timeIntervalSince(riskDetectedAt) >= 24 * 60 * 60 - 1,
-            "安全验证后未停止后台并立即持久化 24 小时冷却"
-        )
-        let longerRiskCooldown = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
-            .addingTimeInterval(48 * 60 * 60)
-        riskStopStore.updateAutomation { $0.safetyCooldownUntil = longerRiskCooldown }
-        riskStopController.registerManualVerificationPage(account: riskStopAccount, url: officialVerificationURL, store: riskStopStore)
-        try verify(riskStopStore.snapshot.automation.safetyCooldownUntil == longerRiskCooldown,
-                   "重复安全验证缩短了已有冷却")
+        let riskIsolationChecks: [(String, Bool)] = [
+            ("单号暂停关闭了后台运行意图", riskStoppedSnapshot.automation.workerEnabled),
+            ("风险账号未持久化暂停", riskStoppedSnapshot.accounts.first?.status == .paused),
+            ("正常账号被一并暂停", riskStoppedSnapshot.accounts.last?.status == .active),
+            ("正常账号没有继续参与调度",
+             BossAutomationController.workerScheduleEligibleAccounts(riskStoppedSnapshot.accounts).map(\.id) == [riskPeerAccount.id]),
+            ("风险账号排队请求没有取消", riskAPI.requestToken(accountID: riskStopAccount.id) != riskToken),
+            ("正常账号的排队请求被取消", riskAPI.requestToken(accountID: riskPeerAccount.id) == peerToken),
+            ("风险账号未知写入未封存", riskStoppedSnapshot.resumeDeliveryRecords.first(where: { $0.accountID == riskStopAccount.id })?.state == .failed &&
+             riskStoppedSnapshot.resumeDeliveryRecords.first(where: { $0.accountID == riskStopAccount.id })?.failureCode == .requestOutcomeUnknown),
+            ("正常账号进行中的投递被改动",
+             riskStoppedSnapshot.resumeDeliveryRecords.first(where: { $0.accountID == riskPeerAccount.id }) ==
+             riskBefore.resumeDeliveryRecords.first(where: { $0.accountID == riskPeerAccount.id })),
+            ("账号暂停改变了岗位记录", riskStoppedSnapshot.jobs == riskBefore.jobs),
+            ("账号暂停改变了开聊防重记录",
+             riskStoppedSnapshot.automaticGreetingAttempts == riskBefore.automaticGreetingAttempts)
+        ]
+        for (message, passed) in riskIsolationChecks { try verify(passed, message) }
         let riskRestartStore = AppStore(persistence: riskStopPersistence)
         riskRestartStore.load()
-        try verify(!riskRestartStore.snapshot.automation.workerEnabled &&
-                   riskRestartStore.snapshot.automation.safetyCooldownUntil != nil,
-                   "重新加载后风险停机状态丢失")
+        try verify(
+            riskRestartStore.snapshot.accounts.first?.status == .paused &&
+            !BossSmokeCommandSafetyPolicy.permitsConnectorAccess(for: riskRestartStore.snapshot.accounts[0]) &&
+            BossSmokeCommandSafetyPolicy.permitsConnectorAccess(for: riskRestartStore.snapshot.accounts[1]),
+            "重启后账号暂停丢失，或诊断命令绕过暂停"
+        )
+        riskStopController.registerManualVerificationPage(account: riskPeerAccount, url: officialVerificationURL, store: riskStopStore)
+        try verify(!riskStopStore.snapshot.automation.workerEnabled &&
+                   riskStopStore.snapshot.accounts.allSatisfy { $0.status == .paused },
+                   "全部账号暂停后仍保留后台运行")
+        riskStopStore.flush()
+        var legacyRiskJSON = try required(
+            JSONSerialization.jsonObject(with: Data(contentsOf: riskStopURL)) as? [String: Any],
+            "无法读取旧版冷却测试文件"
+        )
+        var legacyAutomation = legacyRiskJSON["automation"] as! [String: Any]
+        legacyAutomation["safetyCooldownUntil"] = ISO8601DateFormatter().string(from: Date().addingTimeInterval(86_400))
+        legacyRiskJSON["automation"] = legacyAutomation
+        try JSONSerialization.data(withJSONObject: legacyRiskJSON).write(to: riskStopURL, options: .atomic)
+        let manualRecoveryStore = AppStore(persistence: riskStopPersistence)
+        manualRecoveryStore.load()
+        let recoveredAutomationJSON = String(
+            decoding: try JSONEncoder().encode(manualRecoveryStore.snapshot.automation), as: UTF8.self
+        )
+        try verify(
+            !recoveredAutomationJSON.contains("safetyCooldownUntil") &&
+            manualRecoveryStore.snapshot.accounts.allSatisfy { $0.status == .paused } &&
+            manualRecoveryStore.setAccountAutomationPaused(accountID: riskStopAccount.id, paused: false) &&
+            !manualRecoveryStore.snapshot.automation.workerEnabled &&
+            manualRecoveryStore.snapshot.accounts[1].status == .paused &&
+            manualRecoveryStore.snapshot.resumeDeliveryRecords.first(where: { $0.accountID == riskStopAccount.id })?.failureCode == .requestOutcomeUnknown &&
+            manualRecoveryStore.snapshot.automaticGreetingAttempts == riskBefore.automaticGreetingAttempts,
+            "旧版全局锁定仍生效，或手动恢复账号启动了后台、恢复了其他账号或清除了防重记录"
+        )
         let riskStopSessions = BossSessionCoordinator()
         let riskStopCodex = CodexController()
-        try verify(
-            !riskStopController.startWorker(using: riskRestartStore, sessions: riskStopSessions, codex: riskStopCodex) &&
-            !riskRestartStore.snapshot.automation.workerEnabled &&
-            riskStopController.statusByAccount[riskStopAccountID]?.contains("安全冷却中") == true,
-            "冷却期间仍允许启动后台等待自动恢复"
+        let canStartAfterManualRecovery = riskStopController.startWorker(
+            using: manualRecoveryStore, sessions: riskStopSessions, codex: riskStopCodex
         )
-        passed.append("risk stop survives restart and preserves longer cooldown")
+        riskStopController.stopWorker(using: manualRecoveryStore)
+        try verify(canStartAfterManualRecovery, "手动恢复后仍受旧版固定冷却锁定")
+        passed.append("risk pause is account scoped, durable, and manually recoverable")
+        passed.append("legacy global cooldown no longer blocks manual startup")
 
         try verify(
             BossProfileRequestPolicy.requests.map(\.path) == [
@@ -1476,6 +1568,9 @@ struct SelfCheck {
         try verify(
             JobSearchPlanningPolicy.explicitRoleQueries(in: explicitRoleRequirements) ==
                 ["Agent研发工程师", "AI应用研发工程师", "全栈研发工程师", "FDE工程师"] &&
+            JobSearchPlanningPolicy.explicitRoleSearchQueries(in: explicitRoleRequirements) ==
+                ["Agent", "AI应用", "全栈", "FDE"] &&
+            JobSearchPlanningPolicy.explicitRoleSearchQueries(in: "岗位：工程师") == ["工程师"] &&
             JobMatchingPolicy.roleTerm("Agent研发工程师", matchesTitle: "智能体后端开发工程师") &&
             JobMatchingPolicy.roleTerm("FDE工程师", matchesTitle: "Forward Deployed Engineer") &&
             !JobMatchingPolicy.roleTerm("AI应用研发工程师", matchesTitle: "AI应用产品经理"),
@@ -1780,7 +1875,8 @@ struct SelfCheck {
         try verify(
             !defaultWorker.usesFastGreetingPacing && savedFastWorker.usesFastGreetingPacing &&
             savedFastWorker.dailyGreetingLimit == 150 &&
-            (30...35).contains(Int(fastDue.timeIntervalSince(requestNow))) &&
+            (35...40).contains(Int(fastDue.timeIntervalSince(requestNow))) &&
+            AutomationSettings.normalizedGreetingIntervalSeconds(30) == 35 &&
             BossRequestPacingPolicy.nextAllowedAt(
                 lastDispatchedAt: requestNow, lastWriteAt: requestNow,
                 isWrite: true, readJitter: 1, writeJitter: 1, now: requestNow, expedited: true
@@ -1788,6 +1884,13 @@ struct SelfCheck {
             "快速节奏未持久化、突破每日上限或全局写间隔"
         )
         passed.append("fast greeting pacing opt-in and shared write floor")
+        try verify(
+            !BossWebAPIRequest(url: OfficialBossLinkService.jobs, method: .POST, isWrite: false).isWrite &&
+            BossWebAPIRequest(url: OfficialBossLinkService.jobs, method: .POST, isWrite: true).isWrite &&
+            BossWebAPIRequest(url: OfficialBossLinkService.jobs, method: .POST).isWrite &&
+            !BossWebAPIRequest(url: OfficialBossLinkService.jobs, method: .GET).isWrite,
+            "只读 POST 查询占用了写入冷却，或未声明的 POST 请求绕过写入限速"
+        )
         try verify(
             BossRequestPacingPolicy.nextAllowedAt(
                 lastDispatchedAt: requestNow, lastWriteAt: requestNow.addingTimeInterval(-80),
@@ -2009,10 +2112,10 @@ struct SelfCheck {
         )
         try verify(
             decodedLegacyPausedAccount.id == legacyPausedAccountID &&
-            decodedLegacyPausedAccount.status == .active,
-            "旧版本地 paused 账号解码后仍被误风控禁用"
+            decodedLegacyPausedAccount.status == .paused,
+            "持久化的账号暂停在解码时被自动恢复"
         )
-        passed.append("legacy paused account recovery")
+        passed.append("paused account survives decoding")
 
         let legacyResumeAutomationURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("BossPilot-LegacyResumeAutomation-\(UUID().uuidString)/state.json")
@@ -4696,7 +4799,7 @@ struct SelfCheck {
         pacingStore.recordAutomaticGreeting(jobID: pacingJobB.id, confirmedMessageID: "1234", deliveredAt: quotaNow)
         try verify(
             pacingStore.nextAutomaticGreetingAllowedAt(accountID: pacingAccountB.id, intervalSeconds: 30)
-                .map { $0 <= quotaNow.addingTimeInterval(35) } == true,
+                .map { $0 >= quotaNow.addingTimeInterval(35) && $0 <= quotaNow.addingTimeInterval(40) } == true,
             "权威回执已确认但开聊仍处于额外等待"
         )
 
@@ -5233,7 +5336,6 @@ struct SelfCheck {
         safetyUpgradeState.automation.greetingIntervalSeconds = 30
         safetyUpgradeState.automation.monitorIntervalMinutes = 30
         safetyUpgradeState.automation.searchIntervalMinutes = 30
-        safetyUpgradeState.automation.safetyCooldownUntil = longerRiskCooldown
         try safetyUpgradePersistence.save(safetyUpgradeState)
         let safetyUpgradeBefore = try safetyUpgradePersistence.load()
         let safetyUpgradeStore = AppStore(persistence: safetyUpgradePersistence)
@@ -5245,11 +5347,10 @@ struct SelfCheck {
             safetyUpgradeStore.snapshot.automation.greetingIntervalSeconds == 180 &&
             safetyUpgradeStore.snapshot.automation.monitorIntervalMinutes == 60 &&
             safetyUpgradeStore.snapshot.automation.searchIntervalMinutes == 60 &&
-            safetyUpgradeStore.snapshot.automation.safetyCooldownUntil == longerRiskCooldown &&
             safetyUpgradeStore.snapshot.accounts == safetyUpgradeBefore.accounts &&
             safetyUpgradeStore.snapshot.jobs == safetyUpgradeBefore.jobs &&
             safetyUpgradeStore.snapshot.automaticGreetingAttempts == safetyUpgradeBefore.automaticGreetingAttempts,
-            "schema 25 未保留 150 次每日上限、降低请求频率或保护账号、岗位、冷却和防重账本"
+            "schema 25 未保留 150 次每日上限、降低请求频率或保护账号、岗位和防重账本"
         )
         safetyUpgradeState.automation.dailyGreetingLimit = 10
         safetyUpgradeState.automation.greetingIntervalSeconds = 600
@@ -5611,17 +5712,16 @@ struct SelfCheck {
         defer { try? FileManager.default.removeItem(at: stateURL.deletingLastPathComponent()) }
         let persistence = JSONStatePersistence(fileURL: stateURL)
         var state = AppSnapshot()
-        let persistedAccount = BossAccount(displayName: "往返测试")
+        var persistedAccount = BossAccount(displayName: "往返测试")
+        persistedAccount.status = .paused
         state.accounts = [persistedAccount]
-        let persistedSafetyCooldown = Date(timeIntervalSince1970: 1_700_086_400)
-        state.automation.safetyCooldownUntil = persistedSafetyCooldown
         try persistence.save(state)
         let loaded = try persistence.load()
         let permissions = try FileManager.default.attributesOfItem(atPath: stateURL.path)[.posixPermissions] as? NSNumber
         try verify(
             loaded.accounts.first?.displayName == "往返测试" &&
-                loaded.automation.safetyCooldownUntil == persistedSafetyCooldown,
-            "状态或安全冷却往返失败"
+                loaded.accounts.first?.status == .paused,
+            "状态或账号暂停往返失败"
         )
         try verify(permissions?.intValue == 0o600, "状态文件权限不是 0600")
         passed.append("state persistence")
@@ -6105,11 +6205,11 @@ struct SelfCheck {
         try verify(reopenedStore.snapshot.jobs.first(where: { $0.id == unavailable.id })?.stage == .discovered,
                    "重新检索到有效路由后仍无法补齐详情")
 
-        try verify(BossServerFailurePolicy.requiresSafetyCooldown(.httpStatus(429)) &&
-                   BossServerFailurePolicy.requiresSafetyCooldown(.httpStatus(403)) &&
-                   BossServerFailurePolicy.requiresSafetyCooldown(.upstream(
+        try verify(BossServerFailurePolicy.requiresAccountPause(.httpStatus(429)) &&
+                   BossServerFailurePolicy.requiresAccountPause(.httpStatus(403)) &&
+                   BossServerFailurePolicy.requiresAccountPause(.upstream(
                     operation: .accountResumeBase, code: 9, message: "访问风险"
-                   )) && !BossServerFailurePolicy.requiresSafetyCooldown(.httpStatus(500)),
+                   )) && !BossServerFailurePolicy.requiresAccountPause(.httpStatus(500)),
                    "可选资料与控制器未共用明确风险分类")
     }
 
@@ -7118,6 +7218,41 @@ struct SelfCheck {
                            fastDelay < BossRequestPacingPolicy.minimumReadIntervalSeconds,
                            "快速开聊突破共享间隔或仍受常规读取间隔阻塞")
 
+                let priorityGate = BossNetworkPacingGate()
+                var priorityOrder: [String] = []
+                try await BossNetworkPacingGate.$expedited.withValue(true) {
+                    try await priorityGate.wait(isWrite: false, discriminator: "priority-prime")
+                    let background = Task { @MainActor in
+                        try await priorityGate.wait(isWrite: false, discriminator: "candidate-background")
+                        priorityOrder.append("background")
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                    let greeting = Task { @MainActor in
+                        try await BossNetworkPacingGate.$prioritizesGreeting.withValue(true) {
+                            try await priorityGate.wait(isWrite: false, discriminator: "greeting-proof")
+                        }
+                        priorityOrder.append("greeting")
+                    }
+                    try await greeting.value
+                    try await background.value
+                    let future = Task { @MainActor in
+                        try await BossNetworkPacingGate.$prioritizesGreeting.withValue(true) {
+                            try await priorityGate.wait(isWrite: true, discriminator: "future-greeting",
+                                                        notBefore: Date().addingTimeInterval(12))
+                        }
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                    let backgroundStartedAt = Date()
+                    try await priorityGate.wait(isWrite: false, discriminator: "background-during-wait")
+                    try verify(Date().timeIntervalSince(backgroundStartedAt) < 6,
+                               "未来的开聊请求阻止了间隔内的候选补货")
+                    future.cancel()
+                    do { try await future.value; throw SelfCheckError.failed("已取消的开聊仍获得时隙") }
+                    catch is CancellationError {}
+                }
+                try verify(priorityOrder == ["greeting", "background"],
+                           "就绪的开聊核验被后台补货读取阻塞")
+
                 let clientProfile = UUID()
                 BossWebSessionService.beginRetiring(profileID: clientProfile)
                 var client: BossWebAPIClient? = BossWebAPIClient(profileID: clientProfile)
@@ -7326,7 +7461,8 @@ struct SelfCheck {
                 completion = .failure(error)
             }
         }
-        let deadline = Date().addingTimeInterval(25)
+        // 包含就绪优先级的真实限速等待，单次取消仍受独立的秒级断言约束。
+        let deadline = Date().addingTimeInterval(45)
         while completion == nil, Date() < deadline {
             _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
         }

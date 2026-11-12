@@ -607,7 +607,11 @@ final class BossResumeExchangeService {
                 source: context.friendSource,
                 securityID: context.securityID
             )
+            let baselineStartedAt = Date()
             let baseline = try await Self.readHistoryPage(client: client, query: query)
+            fputs(String(format: "GREETING BASELINE: profile=%@ seconds=%.2f fast=%d\n",
+                         String(profileID.uuidString.suffix(4)), Date().timeIntervalSince(baselineStartedAt),
+                         BossNetworkPacingGate.expedited ? 1 : 0), stderr)
             if let existing = BossGreetingDeliveryPolicy.confirmedMessage(
                 in: baseline.messages,
                 text: normalizedText,
@@ -1562,6 +1566,7 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
     private var webView: WKWebView!
     private(set) var isInvalidated = false
     private var isPrepared = false
+    private var preparationReloads = 0
     private var operationInFlight = false
     private var operationWaiters: [CheckedContinuation<Void, Never>] = []
     private var preparationID: UUID?
@@ -1609,7 +1614,7 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
         guard request.url.isAllowed(for: request.endpoint) else {
             throw BossResumeExchangeError.endpointNotAllowed
         }
-        if !isPrepared || webView.url?.isAllowedWarmupURL != true {
+        if !isPrepared || webView.url?.isAllowed(for: .warmup) != true {
             try await BossNetworkPacingGate.shared.wait(
                 isWrite: false,
                 discriminator: "resume-warmup|\(profileID.uuidString)",
@@ -1832,6 +1837,9 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
         expectedSecurityID: String,
         expectedJobID: String
     ) async throws -> BossGreetingConversationContext {
+        let routeStartedAt = Date()
+        let initialReloads = preparationReloads
+        let initiallyPrepared = isPrepared
         // 优先复用已加载路由，仅在 friend/add 尚未写入页面缓存时重新加载。
         try await prepare()
         var lastFriendCount = 0
@@ -1840,7 +1848,7 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
         var lastSelectedHasFriend = false
         for attempt in 0..<50 {
             try Task.checkCancellation()
-            if attempt == 1, !lastTargetLocated {
+            if attempt == 6, !lastTargetLocated {
                 isPrepared = false
                 try await prepare()
             }
@@ -1989,6 +1997,10 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
             guard remoteJobID == expectedJobID else {
                 throw BossResumeExchangeError.greetingConversationMismatch
             }
+            fputs(String(format: "GREETING ROUTE: profile=%@ seconds=%.2f reloads=%d polls=%d prepared=%d fast=%d\n",
+                         String(profileID.uuidString.suffix(4)), Date().timeIntervalSince(routeStartedAt),
+                         preparationReloads - initialReloads, attempt, initiallyPrepared ? 1 : 0,
+                         BossNetworkPacingGate.expedited ? 1 : 0), stderr)
             return BossGreetingConversationContext(
                 recruiterName: recruiterName,
                 friendID: friendID,
@@ -2143,7 +2155,8 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
               });
               return;
             }
-            setTimeout(() => finish({ sent: false, reason: 'acknowledgementTimeout' }), 15000);
+            // 发送只调用一次，ACK 未及时到达时尽早交给服务端历史确认。
+            setTimeout(() => finish({ sent: false, reason: 'acknowledgementTimeout' }), 1000);
           });
         """
         let result = try await evaluateAsyncDictionary(script)
@@ -2233,6 +2246,64 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
         }
         let value = try await client.evaluateDictionary("({value: 1})")
         guard value["value"] as? Int == 1 else { throw SelfCheckError.failed("同步 JavaScript 桥接失败") }
+        _ = try await client.evaluateDictionary("""
+        (() => {
+          window.fixtureGreetingSendCount = 0;
+          window.fixtureGreetingUnsubscribeCount = 0;
+          const selection = { value: {
+            friendId: 'fixture-friend', encryptBossId: 'fixture-boss',
+            encryptJobId: 'fixture-job', securityId: 'fixture-security'
+          }};
+          const sender = { sendMessage: () => { window.fixtureGreetingSendCount++; } };
+          const stream = { subscribe: () => ({ unsubscribe: () => {
+            window.fixtureGreetingUnsubscribeCount++;
+          }}) };
+          window.ChatWebsocket = {
+            client: { isConnected: () => true }, sync$: stream, message$: stream
+          };
+          window.webpackChunkGeekChat = [];
+          window.webpackChunkGeekChat.push = chunk => {
+            chunk[2](id => id === 42769 ? { A: { subject: { selectedFriend$: selection } } } : { A: sender });
+          };
+          return { ready: true };
+        })()
+        """)
+        let greetingContext = BossGreetingConversationContext(
+            recruiterName: "Fixture", friendID: "fixture-friend", encryptedBossID: "fixture-boss",
+            remoteJobID: "fixture-job", securityID: "fixture-security", friendSource: 0, currentUserID: "fixture-self"
+        )
+        let greetingStartedAt = Date()
+        try await client.sendGreeting(context: greetingContext, text: "fixture greeting")
+        let acknowledgementWait = Date().timeIntervalSince(greetingStartedAt)
+        let greetingState = try await client.evaluateDictionary(
+            "({ count: window.fixtureGreetingSendCount, unsubscribed: window.fixtureGreetingUnsubscribeCount })"
+        )
+        guard acknowledgementWait >= 0.8, acknowledgementWait < 3,
+              greetingState["count"] as? Int == 1,
+              greetingState["unsubscribed"] as? Int == 2 else {
+            throw SelfCheckError.failed("缺少 ACK 时没有及时交给历史核对、重复提交或未清理订阅")
+        }
+        let mismatchedGreeting = BossGreetingConversationContext(
+            recruiterName: "Fixture", friendID: "fixture-friend", encryptedBossID: "fixture-boss",
+            remoteJobID: "different-job", securityID: "fixture-security", friendSource: 0, currentUserID: "fixture-self"
+        )
+        do {
+            try await client.sendGreeting(context: mismatchedGreeting, text: "fixture greeting")
+            throw SelfCheckError.failed("账号页面会话不符仍提交招呼语")
+        } catch BossResumeExchangeError.greetingConversationMismatch {}
+        let preservedGreeting = try await client.evaluateDictionary("({ count: window.fixtureGreetingSendCount })")
+        guard preservedGreeting["count"] as? Int == 1 else {
+            throw SelfCheckError.failed("会话不符时发生重复提交")
+        }
+        var chatLocation = URLComponents(url: try BossResumeOfficialRequest.warmupURL(), resolvingAgainstBaseURL: false)!
+        chatLocation.queryItems = [URLQueryItem(name: "friendId", value: "fixture-friend")]
+        guard chatLocation.url?.isAllowed(for: .warmup) == true,
+              chatLocation.url?.isAllowedWarmupURL == false,
+              URL(string: "https://example.invalid/web/geek/chat")?.isAllowed(for: .warmup) == false,
+              URL(string: "https://www.zhipin.com/web/passport/verify.html")?.isAllowed(for: .warmup) == false else {
+            throw SelfCheckError.failed("聊天页路由导致重复预热，或错误接受非官方页面及验证页")
+        }
+        print(String(format: "GREETING acknowledgement fallback %.2f s; one submission; route mismatch blocked", acknowledgementWait))
         let startedAt = Date()
         do {
             _ = try await client.evaluateAsyncDictionary(
@@ -2329,7 +2400,8 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
             throw BossResumeExchangeError.unauthenticated
         }
         guard !isInvalidated else { throw BossResumeExchangeError.serviceInvalidated }
-        if isPrepared, webView.url?.isAllowedWarmupURL == true { return }
+        // 页面选中会话可附带查询参数，仍只复用同源的官方聊天路径。
+        if isPrepared, webView.url?.isAllowed(for: .warmup) == true { return }
         guard preparationContinuation == nil else {
             throw BossResumeExchangeError.navigationFailed
         }
@@ -2359,6 +2431,7 @@ private final class BossResumeExchangeProfileClient: NSObject, WKNavigationDeleg
                 timeoutInterval: 25
             )
             request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+            preparationReloads += 1
             webView.load(request)
         }
     }

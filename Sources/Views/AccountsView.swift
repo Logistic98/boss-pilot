@@ -187,6 +187,7 @@ private struct AccountRow: View {
 
     private var rowSubtitle: String {
         if account.status == .deleting { return "待完成删除" }
+        if account.status == .paused { return "自动任务已暂停" }
         if account.manualVerificationChallenge != nil { return "需要本人验证" }
         switch session.phase {
         case .authenticated: return session.automationReady ? "可同步" : "会话准备中"
@@ -200,6 +201,7 @@ private struct AccountRow: View {
     }
 
     private var rowIcon: String {
+        if account.status == .paused { return "pause.circle" }
         if account.manualVerificationChallenge != nil { return "person.badge.shield.checkmark" }
         switch session.phase {
         case .authenticated: return session.automationReady ? "checkmark.circle.fill" : "hourglass"
@@ -210,6 +212,7 @@ private struct AccountRow: View {
     }
 
     private var rowColor: Color {
+        if account.status == .paused { return .orange }
         if account.manualVerificationChallenge != nil { return .orange }
         switch session.phase {
         case .authenticated: return session.automationReady ? .green : .orange
@@ -399,6 +402,25 @@ private struct AccountDetailView: View {
 
     @ViewBuilder
     private var accountHeaderActions: some View {
+        if account.status == .paused {
+            HStack(spacing: 8) {
+                Label("此账号自动任务已暂停", systemImage: "pause.circle")
+                    .foregroundStyle(.orange)
+                Spacer()
+                Button("我已检查，恢复此账号") {
+                    if store.setAccountAutomationPaused(accountID: account.id, paused: false) {
+                        store.addActivity(
+                            accountID: account.id, level: .info, title: "账号自动任务已恢复",
+                            detail: store.snapshot.automation.workerEnabled
+                                ? "已手动恢复此账号，将继续参与自动任务。"
+                                : "已手动恢复此账号，自动运行仍保持停止。"
+                        )
+                        store.flush()
+                    }
+                }
+                .help("请先检查 BOSS 官方页面。仅恢复此账号，不会启动已停止的后台任务。")
+            }
+        }
         if isAuthenticated {
             HStack(spacing: 8) {
                 Spacer()
@@ -661,6 +683,7 @@ private struct AccountDetailView: View {
 
     private var sessionStatusTitle: String {
         if account.status == .deleting { return "删除中" }
+        if account.status == .paused { return "自动任务已暂停" }
         if account.manualVerificationChallenge != nil { return "需要本人验证" }
         switch session.phase {
         case .authenticated: return session.automationReady ? "可同步" : "已登录 · 准备中"
@@ -674,6 +697,7 @@ private struct AccountDetailView: View {
     }
 
     private var sessionStatusIcon: String {
+        if account.status == .paused { return "pause.circle" }
         if account.manualVerificationChallenge != nil { return "person.badge.shield.checkmark" }
         switch session.phase {
         case .authenticated: return session.automationReady ? "checkmark.circle.fill" : "hourglass"
@@ -684,6 +708,7 @@ private struct AccountDetailView: View {
     }
 
     private var sessionStatusColor: Color {
+        if account.status == .paused { return .orange }
         if account.manualVerificationChallenge != nil { return .orange }
         switch session.phase {
         case .authenticated: return session.automationReady ? .green : .orange
@@ -694,6 +719,7 @@ private struct AccountDetailView: View {
     }
 
     private var sessionSubtitle: String {
+        if account.status == .paused { return "请检查 BOSS 提示后手动恢复此账号，其他账号不受影响" }
         if account.manualVerificationChallenge != nil {
             return "已暂停该账号的 BOSS 请求，等待你在官方页面完成验证"
         }

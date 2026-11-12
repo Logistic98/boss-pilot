@@ -57,7 +57,8 @@ enum BossJobSearchPaginationPolicy {
         remoteIdentityID: String,
         resumeID: UUID,
         requirementText: String,
-        targets: [BossJobSearchTarget]
+        targets: [BossJobSearchTarget],
+        now: Date = Date()
     ) -> String {
         let identity = remoteIdentityID.trimmingCharacters(in: .whitespacesAndNewlines)
         let requirement = requirementText
@@ -69,6 +70,7 @@ enum BossJobSearchPaginationPolicy {
         let material = [
             "identity:\(identity)",
             "resume:\(resumeID.uuidString.lowercased())",
+            "day:\(Calendar.current.startOfDay(for: now).timeIntervalSince1970)",
             "requirement:\(requirement)",
             "targets:\(targetMaterial)"
         ].joined(separator: "\u{1f}")
@@ -87,7 +89,7 @@ struct AutomationSettings: Codable, Hashable {
     static let monitorIntervalMinutesRange = 30...180
     static let searchIntervalMinutesRange = 30...360
     static let dailyGreetingLimitRange = 1...150
-    static let fastGreetingIntervalSeconds = 30
+    static let fastGreetingIntervalSeconds = 35
     static let greetingIntervalSecondsRange = fastGreetingIntervalSeconds...1_800
     static let defaultDailyGreetingLimit = 150
     static let defaultMonitorIntervalMinutes = 60
@@ -108,7 +110,6 @@ struct AutomationSettings: Codable, Hashable {
     var searchIntervalMinutes: Int = Self.defaultSearchIntervalMinutes
     var dailyGreetingLimit: Int = Self.defaultDailyGreetingLimit
     var greetingIntervalSeconds: Int = Self.defaultGreetingIntervalSeconds
-    var safetyCooldownUntil: Date?
     var jobSearchPaginationStates: [BossJobSearchPaginationState] = []
 
     var allowsDrafting: Bool { mode != .remindersOnly }
@@ -124,7 +125,6 @@ struct AutomationSettings: Codable, Hashable {
         case workerEnabled, automaticallySearchJobs, automaticallyMonitorMessages
         case automaticallySendGreetings, automaticallySendResume
         case monitorIntervalMinutes, searchIntervalMinutes, dailyGreetingLimit, greetingIntervalSeconds
-        case safetyCooldownUntil
         case jobSearchPaginationStates
     }
 
@@ -155,7 +155,6 @@ struct AutomationSettings: Codable, Hashable {
         greetingIntervalSeconds = Self.normalizedGreetingIntervalSeconds(
             try container.decodeIfPresent(Int.self, forKey: .greetingIntervalSeconds) ?? Self.defaultGreetingIntervalSeconds
         )
-        safetyCooldownUntil = try container.decodeIfPresent(Date.self, forKey: .safetyCooldownUntil)
         let decodedPaginationStates = try container.decodeIfPresent(
             [BossJobSearchPaginationState].self,
             forKey: .jobSearchPaginationStates
@@ -453,7 +452,7 @@ enum BossRequestPacingPolicy {
     static let maximumReadJitterSeconds = 2
     static let minimumWriteIntervalSeconds: TimeInterval = 60
     static let maximumWriteJitterSeconds = 4
-    static let fastReadIntervalSeconds: TimeInterval = 2
+    static let fastReadIntervalSeconds: TimeInterval = 3
     static let fastWriteIntervalSeconds: TimeInterval = 5
 
     static func nextAllowedAt(

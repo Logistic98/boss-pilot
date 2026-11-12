@@ -151,7 +151,7 @@ struct AutomationSettingsTab: View {
                     value: intBinding(\.dailyGreetingLimit), in: AutomationSettings.dailyGreetingLimitRange, step: 5)
             Stepper("开聊间隔：至少 \(store.snapshot.automation.greetingIntervalSeconds) 秒",
                     value: intBinding(\.greetingIntervalSeconds), in: AutomationSettings.greetingIntervalSecondsRange, step: 15)
-            Button(store.snapshot.automation.usesFastGreetingPacing ? "恢复默认节奏" : "使用快速开聊（30 秒）") {
+            Button(store.snapshot.automation.usesFastGreetingPacing ? "恢复默认节奏" : "使用快速开聊（\(AutomationSettings.fastGreetingIntervalSeconds) 秒）") {
                 store.updateAutomation {
                     $0.greetingIntervalSeconds = $0.usesFastGreetingPacing
                         ? AutomationSettings.defaultGreetingIntervalSeconds : AutomationSettings.fastGreetingIntervalSeconds
@@ -186,10 +186,8 @@ struct AutomationSettingsTab: View {
 
     private var runHint: String? {
         guard store.snapshot.automation.mode == .automatic else { return nil }
-        if let cooldownUntil = store.snapshot.automation.safetyCooldownUntil,
-           cooldownUntil > Date() {
-            return "后台已停止，请于 \(cooldownUntil.formatted(date: .abbreviated, time: .shortened)) 后检查账号并手动启动。"
-        }
+        let pausedCount = store.snapshot.accounts.filter { $0.status == .paused }.count
+        if pausedCount > 0 { return "有 \(pausedCount) 个账号已暂停，可在“账号管理”检查并手动恢复。" }
         if !challengedAccounts.isEmpty, !hasRunnableAuthenticatedAccount {
             return "请完成 BOSS 本人验证后重试。"
         }
@@ -313,7 +311,6 @@ struct AutomationSettingsTab: View {
 
     private var canStartAutomaticWorker: Bool {
         store.snapshot.automation.mode == .automatic &&
-        store.snapshot.automation.safetyCooldownUntil.map { $0 > Date() } != true &&
         hasRunnableAuthenticatedAccount &&
         store.snapshot.resume.hasStoredAttachment &&
         (store.snapshot.automation.automaticallySearchJobs || store.snapshot.automation.automaticallyMonitorMessages) &&
@@ -322,6 +319,9 @@ struct AutomationSettingsTab: View {
 
     private var readinessMessage: String {
         if store.snapshot.automation.mode != .automatic { return "未开启自动任务，可从总览手动同步。" }
+        if !hasRunnableAuthenticatedAccount, store.snapshot.accounts.contains(where: { $0.status == .paused }) {
+            return "请先在“账号管理”检查并恢复至少一个账号。"
+        }
         if !challengedAccounts.isEmpty, !hasRunnableAuthenticatedAccount {
             return "请在 BOSS 完成验证后重新检查。"
         }

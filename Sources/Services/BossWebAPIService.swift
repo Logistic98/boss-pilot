@@ -28,11 +28,13 @@ struct BossWebAPIRequest: Equatable, Sendable {
     let url: URL
     let method: Method
     let formBody: String?
+    let isWrite: Bool
 
-    init(url: URL, method: Method, formBody: String? = nil) {
+    init(url: URL, method: Method, formBody: String? = nil, isWrite: Bool? = nil) {
         self.url = url
         self.method = method
         self.formBody = formBody
+        self.isWrite = isWrite ?? (method == .POST)
     }
 }
 
@@ -71,7 +73,7 @@ final class BossWebAPIService {
         guard isStillValid() else { throw CancellationError() }
         try await client.prepare(at: warmupURL)
         try await BossNetworkPacingGate.shared.wait(
-            isWrite: request.method == .POST,
+            isWrite: request.isWrite,
             discriminator: "web-api|\(profileID.uuidString)|\(request.url.path)",
             isStillValid: {
                 guard isStillValid() else { return false }

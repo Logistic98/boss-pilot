@@ -121,17 +121,18 @@ enum BossServerFailurePolicy {
         manualVerificationCodes.contains(code)
     }
 
-    static func requiresSafetyCooldown(_ error: BossAPIError) -> Bool {
+    static func requiresAccountPause(_ error: BossAPIError) -> Bool {
         switch error {
         case .httpStatus(429), .httpStatus(403), .manualVerificationRequired:
             return true
-        case .upstream(_, let code, let message):
+        case .upstream(let operation, let code, let message):
             let riskMarkers = [
                 "频繁", "限流", "too many requests", "rate limit",
                 "账号已封禁", "账号被封禁", "账号已冻结", "账号被冻结",
-                "account suspended", "account banned"
+                "account suspended", "account banned", "操作异常", "访问异常", "异常行为", "安全验证"
             ]
-            return code == 9 || riskMarkers.contains {
+            return code == 9 ||
+                (operation == .greet && code == 1 && message.contains("开聊提醒")) || riskMarkers.contains {
                 message.localizedCaseInsensitiveContains($0)
             }
         default:
@@ -505,7 +506,7 @@ actor BossAPIService {
                 payloads[request.operation] = result.object
             } catch let error as BossAPIError {
                 guard !request.isRequired else { throw error }
-                if BossServerFailurePolicy.requiresSafetyCooldown(error) { throw error }
+                if BossServerFailurePolicy.requiresAccountPause(error) { throw error }
                 switch error {
                 case .httpStatus, .upstream, .invalidPayload, .unsupported:
                     warnings.append(error.localizedDescription)
@@ -630,7 +631,8 @@ actor BossAPIService {
                 request: BossWebAPIRequest(
                     url: url,
                     method: method,
-                    formBody: method == .POST ? formBody : nil
+                    formBody: method == .POST ? formBody : nil,
+                    isWrite: isWrite
                 ),
                 warmupURL: warmupURL,
                 isStillValid: { [requestEpochGate] in

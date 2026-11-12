@@ -151,9 +151,7 @@ struct BossAccount: Identifiable, Codable, Hashable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if customName?.isEmpty == true { customName = nil }
         browserProfileHint = try container.decodeIfPresent(String.self, forKey: .browserProfileHint) ?? ""
-        let decodedStatus = try container.decodeIfPresent(AccountStatus.self, forKey: .status) ?? .active
-        // 旧版 paused 是本地错误状态，迁移时移除，避免一次请求失败永久停用账号。
-        status = decodedStatus == .paused ? .active : decodedStatus
+        status = try container.decodeIfPresent(AccountStatus.self, forKey: .status) ?? .active
         webProfileID = try container.decodeIfPresent(UUID.self, forKey: .webProfileID) ?? id
         loginStatus = try container.decodeIfPresent(BossLoginStatus.self, forKey: .loginStatus) ?? .loggedOut
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()

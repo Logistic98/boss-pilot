@@ -126,6 +126,15 @@ final class AppStore: ObservableObject {
     }
 
     @discardableResult
+    func setAccountAutomationPaused(accountID: UUID, paused: Bool) -> Bool {
+        guard let index = snapshot.accounts.firstIndex(where: { $0.id == accountID }),
+              snapshot.accounts[index].status == (paused ? .active : .paused) else { return false }
+        snapshot.accounts[index].status = paused ? .paused : .active
+        scheduleSave()
+        return true
+    }
+
+    @discardableResult
     func addBossAccount() -> UUID {
         var sequence = snapshot.accounts.count + 1
         var name = "BOSS 账号 \(sequence)"
